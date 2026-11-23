@@ -237,17 +237,66 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// R8G8B8A8_UNORM, which stands in for a packed 16-bit render target the
+/// host cannot make (see [`target_format`]).
+const RGBA8_UNORM: u32 = 28;
+
+/// The console's packed 16-bit colour formats a title renders to:
+/// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
+const PACKED_16: [u32; 2] = [86, 115];
+
+/// Whether the host GPU lacks render-target or typed unordered-access
+/// support for `format` (asked once per format). NVIDIA has neither for
+/// B4G4R4A4 and no typed UAV for B5G5R5A1, which Grand Theft Auto VI's
+/// 2560x1440 UI targets need; AMD has both.
+#[cfg(any(windows, target_os = "linux"))]
+fn host_lacks_target(format: u32) -> bool {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    static LACKS: [OnceLock<bool>; 2] = [OnceLock::new(), OnceLock::new()];
+    let Some(i) = PACKED_16.iter().position(|&f| f == format) else {
+        return false;
+    };
+    *LACKS[i].get_or_init(|| {
+        let Some(host) = crate::host::host() else { return false };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: the structure the feature names, ours.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>() as u32,
+            )
+        };
+        let needed = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let lacks = asked.is_err() || support.Support1.0 & needed != needed;
+        if lacks {
+            tracing::info!(format, "packed 16-bit render targets are R8G8B8A8_UNORM on this GPU");
+        }
+        lacks
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn host_lacks_target(_: u32) -> bool {
+    false
+}
+
 /// The format a render target or unordered-access texture of `format` is
 /// made in on the host, and that render target views and pipelines name:
-/// `R16G16B16A16_FLOAT` (10) for `R9G9B9E5_SHAREDEXP` (67), which PC D3D12
-/// forbids as a render target or unordered-access resource; else
-/// [`pc_format`]. Textures only sampled keep `R9G9B9E5_SHAREDEXP`.
+/// R8G8B8A8_UNORM for a packed 16-bit format the GPU cannot render to or
+/// write typed (each channel keeps its value, with more precision); else
+/// the format as the host has it. Textures only sampled keep theirs.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const R9G9B9E5_SHAREDEXP: u32 = 67;
-    const RGBA16_FLOAT: u32 = 10;
     let format = pc_format(format);
-    if format == R9G9B9E5_SHAREDEXP {
-        RGBA16_FLOAT
+    if format == 67 {
+        10 // R9G9B9E5_SHAREDEXP target -> R16G16B16A16_FLOAT
+    } else if PACKED_16.contains(&format) && host_lacks_target(format) {
+        RGBA8_UNORM
     } else {
         format
     }
