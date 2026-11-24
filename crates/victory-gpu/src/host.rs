@@ -700,6 +700,8 @@ pub(crate) struct HostList {
     pub(crate) validation: Mutex<crate::validation::Draws>,
     #[cfg(feature = "diagnostics")]
     pub(crate) mesh_stats: OnceLock<Option<crate::capture::MeshStats>>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) producers: crate::producers::Journal,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1051,6 +1053,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 mesh_stats: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
+                producers: Default::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -1123,6 +1127,25 @@ impl Host {
                     #[cfg(not(windows))]
                     Ok(()) => {}
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            if crate::producers::word().is_some() {
+                // A removed device reports UINT64_MAX as its completed fence.
+                let completed = unsafe { self.fence.GetCompletedValue() };
+                let completed = completed != u64::MAX && completed >= *submitted;
+                if groups.len() == 1 {
+                    let mut lists = std::collections::HashSet::new();
+                    let mut repeated = std::collections::HashSet::new();
+                    for &list in runs {
+                        let id = std::ptr::from_ref(list);
+                        if !lists.insert(id) { repeated.insert(id); }
+                    }
+                    for (index, &list) in runs.iter().enumerate() {
+                        list.producers.report(*submitted, index, completed && !repeated.contains(&std::ptr::from_ref(list)));
+                    }
+                } else {
+                    runs[i].producers.report(*submitted, i, completed);
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -1383,18 +1406,6 @@ pub(crate) fn query_storage(ty: D3D12_QUERY_HEAP_TYPE, count: u32, element_bytes
 {
     let device = &host()?.device;
     let mut heap: Option<ID3D12QueryHeap> = None;
-    let mut back: Option<ID3D12Resource> = None;
-    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: u64::from(count) * element_bytes,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        ..Default::default()
-    };
     // SAFETY: plain object creation.
     unsafe {
         device
@@ -1403,6 +1414,27 @@ pub(crate) fn query_storage(ty: D3D12_QUERY_HEAP_TYPE, count: u32, element_bytes
                 &mut heap,
             )
             .ok()?;
+    }
+    Some((heap?, readback_buffer(u64::from(count) * element_bytes)?))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn readback_buffer(bytes: u64) -> Option<ID3D12Resource> {
+    let device = &host()?.device;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    // SAFETY: a new linear readback buffer of the requested size.
+    unsafe {
         device
             .CreateCommittedResource(
                 &readback,
@@ -1414,7 +1446,7 @@ pub(crate) fn query_storage(ty: D3D12_QUERY_HEAP_TYPE, count: u32, element_bytes
             )
             .ok()?;
     }
-    Some((heap?, back?))
+    back
 }
 
 impl HostList {
@@ -1546,6 +1578,8 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        #[cfg(feature = "diagnostics")]
+        self.producers.reset();
         *self.deferred() = Deferred::default();
         #[cfg(feature = "diagnostics")]
         if crate::validation::enabled() { self.validation.lock().unwrap_or_else(|e| e.into_inner()).reset(); }

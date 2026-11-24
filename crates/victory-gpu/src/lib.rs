@@ -23,6 +23,8 @@ extern crate victory_windows as windows;
 mod capture;
 #[cfg(feature = "diagnostics")]
 mod validation;
+#[cfg(feature = "diagnostics")]
+mod producers;
 pub mod console;
 #[cfg(feature = "diagnostics")]
 mod copystat;

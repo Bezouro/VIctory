@@ -243,6 +243,27 @@ or waits for the worker already compiling it. This preserves one-shot writes
 such as the inputs to later indirect mesh draws. Diagnostics can reproduce the previous behaviour with
 `VICTORY_COMPUTE_POLICY=budget`, including its shared per-frame wait budget. Cold compute compiles can stall the first frame that uses them.
 
+For a diagnostic build, `VICTORY_PRODUCER_X=0x9c8c01c80` watches one
+four-byte-aligned **guest address**. Use the X address from the mesh
+indirect trace of the scene under investigation. Guest allocations can move
+between runs. A matching console compute table UAV is a producer candidate.
+A dropped dispatch logs its shader hash, covered range and reason. An issued
+dispatch samples the exact dword immediately before and after the command.
+A changed pair demonstrates a change on that host buffer during the command. Equal values
+also occur when a shader stores the value already present. Heap indexing
+outside reflected table UAVs and CPU writes are outside this producer trace.
+
+For submitted indirect compute and mesh commands, the trace samples X
+after clamping and records the optional count to show whether that record
+was selected. Compare the host buffer identity for candidate and consumer
+when title-address aliases are suspected. Events are printed in host GPU
+submission order (fence, list index, operation index). The recording ID
+also distinguishes a replay from a newly recorded list. An incomplete fence,
+a device loss or reusing one list's readback slots twice in the same batch
+leaves the affected samples unavailable. Each recording retains up to 1024
+events and reports truncation. The GPU probes add copies and transitions,
+so measure frame times separately.
+
 `VICTORY_TRACE_COMPUTE` takes comma-separated shader hashes. The diagnostics
 log includes root constants, buffer views and the GPU's compute invocation
 count after submission. Mesh and compute queries share 32 entries per list.

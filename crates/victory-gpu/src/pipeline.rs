@@ -66,6 +66,8 @@ pub(crate) struct Shader {
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(feature = "diagnostics")]
     wave64: OnceLock<bool>,
+    #[cfg(feature = "diagnostics")]
+    native_uavs: OnceLock<Vec<victory_shader::UsedResource>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -92,6 +94,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 wave64: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                native_uavs: OnceLock::new(),
             })
         })
         .clone()
@@ -213,6 +217,28 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stage_names(this: This) -> String {
     { let p = pipeline(this); format!("{:?} key={}", p.shaders, p.host.key()) }
+}
+
+/// Reflect console UAVs even if host translation failed or is still queued.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn compute_uavs(this: This) -> Option<(&'static str, &'static [victory_shader::UsedResource])> {
+    if this.is_null() { return None; }
+    let shader = pipeline(this).shaders.iter().find(|s| s.stage == "compute")?;
+    let uavs = shader.native_uavs.get_or_init(|| {
+        let programs = victory_shader::Container::parse(&shader.container).ok().and_then(|c| {
+            victory_shader::native_programs(c.part(victory_shader::FourCC::DXIL)?.data).ok()
+        });
+        programs.into_iter().flatten().flat_map(|p| p.used)
+            .filter(|u| u.kind == victory_shader::ResourceType::Uav && u.root == victory_shader::RootType::Table)
+            .collect()
+    });
+    Some((&shader.hash, uavs))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn miss_reason(this: This) -> String {
+    if this.is_null() { return "no title pipeline".into(); }
+    make::missing(&pipeline(this).host).unwrap_or_else(|| "host pipeline unavailable".into())
 }
 
 #[cfg(feature = "diagnostics")]

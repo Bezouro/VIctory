@@ -700,10 +700,43 @@ impl State {
         true
     }
 
+    /// A table UAV covering the requested dword is a candidate, even if
+    /// the shader never reaches a store. This only inspects guest views.
+    #[cfg(feature = "diagnostics")]
+    fn producer_range(&self) -> Option<(&str, (u64, u64), u64)> {
+        let address = crate::producers::word()?;
+        let (hash, uavs) = crate::pipeline::compute_uavs(self.pipeline as This)?;
+        for u in uavs {
+            let Some(Root::Table(table)) = self.compute.get(usize::from(u.slot)) else { continue };
+            let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4) else { continue };
+            let Some(view) = crate::descriptor::view(handle) else { continue };
+            let Some(range) = crate::descriptor::host::buffer_range(&view) else { continue };
+            if crate::producers::covers(range.0, range.1, address) {
+                return Some((hash, range, address));
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn dropped_producer(&self, list: &HostList, why: &str) {
+        if let Some((hash, range, _)) = self.producer_range() {
+            let why = if why == "no host pipeline" { format!("{why}: {}", crate::pipeline::miss_reason(self.pipeline as This)) } else { why.to_owned() };
+            list.producers.dropped(hash, range, why);
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn sample_producer(&self, list: &HostList) -> Option<crate::producers::Sample> {
+        let (shader, range, address) = self.producer_range()?;
+        crate::producers::Journal::before(list, shader, range, address)
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            self.dropped_producer(list, "explicit diagnostics skip");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
@@ -711,6 +744,8 @@ impl State {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::compute_miss(self.pipeline as This);
+            #[cfg(feature = "diagnostics")]
+            self.dropped_producer(list, "no host pipeline");
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -725,6 +760,8 @@ impl State {
             return false;
         }
         if !self.bind(list, p, true) {
+            #[cfg(feature = "diagnostics")]
+            self.dropped_producer(list, "binding failed");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -732,8 +769,12 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         let query = crate::capture::MeshStats::begin_compute(list, &p.name, Some([x, y, z]));
+        #[cfg(feature = "diagnostics")]
+        let producer = self.sample_producer(list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        crate::producers::Journal::after(list, producer);
         #[cfg(feature = "diagnostics")]
         crate::capture::MeshStats::end(list, query);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1212,6 +1253,7 @@ impl State {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            if kind == 2 { self.dropped_producer(list, "explicit diagnostics skip"); }
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
@@ -1220,19 +1262,22 @@ impl State {
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
         #[cfg(feature = "diagnostics")]
-        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        let why = |state: &Self, what: &str| {
+            if kind == DISPATCH { state.dropped_producer(list, what); }
+            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        };
         #[cfg(not(feature = "diagnostics"))]
-        let why = |_: &str| {};
+        let why = |_: &Self, _: &str| {};
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
-            why("arguments outside title buffers");
+            why(self, "arguments outside title buffers");
             return false;
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
-                    why("count outside title buffers");
+                    why(self, "count outside title buffers");
                     return false;
                 }
             },
@@ -1242,24 +1287,24 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
-            why("no host signature");
+            why(self, "no host signature");
             return false;
         };
         // The clamp writes argument records and consumes the list's work
         // budget. A pipeline still being compiled cannot use either.
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
-            if kind == DISPATCH { crate::pipeline::compute_miss(self.pipeline as This); }
+            if kind == DISPATCH { crate::pipeline::compute_miss(self.pipeline as This); self.dropped_producer(list, "no host pipeline"); }
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
         if p.compute != (kind == DISPATCH) || p.mesh != (kind == MESH) {
-            why("pipeline kind does not match indirect command");
+            why(self, "pipeline kind does not match indirect command");
             return false;
         }
         if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
-            why("rectangle topology");
+            why(self, "rectangle topology");
             return false;
         }
         args.refresh(list, arguments, len);
@@ -1273,7 +1318,7 @@ impl State {
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max),
             counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at)))) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            why(self, "not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
         self.host_pipeline = 0;
@@ -1284,7 +1329,7 @@ impl State {
             self.prepare_graphics(list, p, kind == INDEXED)
         };
         if !ran {
-            why("binding failed");
+            why(self, "binding failed");
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -1308,6 +1353,14 @@ impl State {
         } else { None };
         #[cfg(feature = "diagnostics")]
         let validation = if kind == DISPATCH { None } else { crate::validation::Draws::begin(list) };
+        #[cfg(feature = "diagnostics")]
+        if matches!(kind, DISPATCH | MESH) && let Some(x) = crate::producers::word()
+            && let Some(record) = crate::producers::record_index(arguments, stride, max, x) {
+            crate::producers::Journal::consumer(list, p.name.clone(), kind, record,
+                (&args.buffer, args.offset(x)), counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))));
+        }
+        #[cfg(feature = "diagnostics")]
+        let producer = (kind == DISPATCH).then(|| self.sample_producer(list)).flatten();
         crate::indirect::execute(
             list,
             &signature,
@@ -1317,6 +1370,8 @@ impl State {
         );
         #[cfg(feature = "diagnostics")]
         crate::capture::MeshStats::end(list, query);
+        #[cfg(feature = "diagnostics")]
+        crate::producers::Journal::after(list, producer);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
