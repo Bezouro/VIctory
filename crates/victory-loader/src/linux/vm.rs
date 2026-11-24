@@ -819,6 +819,14 @@ pub fn protect(address: usize, size: usize, new: u32) -> Result<u32, u32> {
     Ok(old)
 }
 
+/// End of a known reservation or inaccessible region containing `address`.
+/// An address outside the guest table can belong to a readable host mapping.
+pub fn inaccessible_end(address: usize) -> Option<usize> {
+    let state = state();
+    let run = &state.runs[&find(&state.runs, address)?];
+    (!run.committed || native_protect(run.protect) == Some(libc::PROT_NONE)).then_some(run.end)
+}
+
 /// `VirtualQuery`. `ERROR_INVALID_PARAMETER` only above [`HIGHEST`], which
 /// is how a walk ends.
 pub fn query(address: usize) -> Result<MemoryBasicInformation, u32> {

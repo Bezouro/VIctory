@@ -2046,6 +2046,18 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    #[cfg(target_os = "linux")]
+    if !title_dst {
+        // The source can be sparse. The destination is an owned, writable
+        // upload or staging buffer; reading it to probe each page is costly
+        // on a write-combined GPU heap.
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        copy_to_host(dst, src, len);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MoveUs, started.elapsed().as_micros() as u64);
+        return;
+    }
     if title_dst {
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
@@ -2082,6 +2094,74 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
             });
         }
     });
+}
+
+/// The guest source is the remote operand so the kernel checks its mapping
+/// during the copy. A short read leaves its completed prefix in place.
+#[cfg(target_os = "linux")]
+fn copy_to_host(mut dst: *mut u8, mut src: *const u8, mut len: usize) {
+    use victory_loader::linux::vm;
+    while len != 0 {
+        let local = libc::iovec { iov_base: dst.cast(), iov_len: len };
+        let remote = libc::iovec { iov_base: src.cast_mut().cast(), iov_len: len };
+        // SAFETY: our host buffer is writable for len bytes. The kernel
+        // checks the guest range and returns the bytes actually transferred.
+        let done = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+        let n = if done > 0 {
+            done as usize
+        } else {
+            let at = src as usize;
+            let known_end = vm::inaccessible_end(at);
+            let n = known_end.map_or(vm::PAGE - at % vm::PAGE, |end| end - at).min(len);
+            // A device mapping cannot always be pinned as a remote iovec.
+            // As a local iovec it can still be copied into ordinary RAM.
+            let mut page = [0u8; vm::PAGE];
+            let copied = if known_end.is_none() {
+                let local = libc::iovec { iov_base: src.cast_mut().cast(), iov_len: n };
+                let remote = libc::iovec { iov_base: page.as_mut_ptr().cast(), iov_len: n };
+                // SAFETY: the kernel checks the source. The sink holds n bytes.
+                unsafe { libc::process_vm_writev(libc::getpid(), &local, 1, &remote, 1, 0) }.max(0) as usize
+            } else {
+                0
+            };
+            // SAFETY: the complete destination is owned and writable.
+            unsafe {
+                if copied != 0 {
+                    std::ptr::copy_nonoverlapping(page.as_ptr(), dst, copied);
+                }
+                dst.add(copied).write_bytes(0, n - copied);
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+                crate::copystat::add(crate::copystat::C::Unmapped, (n - copied) as u64);
+            }
+            n
+        };
+        src = src.wrapping_add(n);
+        dst = dst.wrapping_add(n);
+        len -= n;
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn upload_preserves_mapped_bytes_on_both_sides_of_a_hole() {
+    use victory_loader::linux::vm::*;
+    let size = 3 * GRANULARITY;
+    let base = alloc(0, size, MEM_RESERVE, PAGE_NOACCESS, PAGE).unwrap();
+    for (offset, byte) in [(0, 7), (2 * GRANULARITY, 11)] {
+        let at = alloc(base + offset, GRANULARITY, MEM_COMMIT, PAGE_READWRITE, PAGE).unwrap();
+        // SAFETY: we just committed this region.
+        unsafe { (at as *mut u8).write_bytes(byte, GRANULARITY) };
+    }
+    let mut dst = vec![0xee; size];
+    copy_to_host(dst.as_mut_ptr().wrapping_add(1), (base + 1) as *const u8, size - 2);
+    assert_eq!((dst[0], dst[size - 1]), (0xee, 0xee));
+    assert!(dst[1..GRANULARITY].iter().all(|&b| b == 7));
+    assert!(dst[GRANULARITY..2 * GRANULARITY].iter().all(|&b| b == 0));
+    assert!(dst[2 * GRANULARITY..size - 1].iter().all(|&b| b == 11));
+    free(base, 0, MEM_RELEASE).unwrap();
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
