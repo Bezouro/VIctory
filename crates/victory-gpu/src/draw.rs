@@ -822,9 +822,10 @@ impl State {
 
     #[cfg(feature = "diagnostics")]
     fn sample_pack_input(&self, list: &HostList, p: &HostPipeline, groups: [u32; 3]) {
-        let Some(x) = crate::producers::word() else { return };
         // This layout applies to the identified PackInstances kernel only.
         if p.name != "[compute c1488f485ad606fb]" || groups[1..] != [1, 1] { return; }
+        let word = crate::producers::word();
+        if word.is_none() && crate::producers::mesh_selector().is_none() { return; }
         let Some(Root::Constants(c)) = self.compute.get(1) else { return };
         let [items, stride, ..] = c.as_slice() else { return };
         if *stride == 0 { return; }
@@ -835,13 +836,10 @@ impl State {
             let handle = table.checked_add(u64::from(u.table_offset_dwords) * 4)?;
             crate::descriptor::host::buffer_range(&crate::descriptor::view(handle)?)
         };
-        let Some((base, size)) = range(ResourceType::Uav, 8) else { return };
-        if !crate::producers::covers(base, size, x) { return; }
-        let offset = x - base;
-        if !offset.is_multiple_of(u64::from(*stride)) { return; }
-        let Ok(record) = u32::try_from(offset / u64::from(*stride)) else { return };
+        let Some(output) = range(ResourceType::Uav, 8) else { return };
+        if word.is_some_and(|x| !crate::producers::covers(output.0, output.1, x)) { return; }
         if let Some(source) = range(ResourceType::Srv, 83) {
-            crate::producers::Journal::pack_input(list, source, (*items).min(groups[0].saturating_mul(64)), record);
+            crate::producers::Journal::pack_input(list, source, (*items).min(groups[0].saturating_mul(64)), output, *stride);
         }
     }
 

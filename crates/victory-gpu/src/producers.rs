@@ -28,15 +28,19 @@ pub(crate) fn word() -> Option<u64> {
     }).or_else(|| LEARNED.get().copied())
 }
 
-/// Select the first record of the first submitted indirect draw matching the
-/// mesh shader. The address stays fixed for the rest of this title process.
-pub(crate) fn select_mesh(pipeline: crate::object::This, arguments: u64, stride: u32, max: u32) {
+pub(crate) fn mesh_selector() -> Option<&'static str> {
     static MESH: OnceLock<Option<String>> = OnceLock::new();
-    let Some(hash) = MESH.get_or_init(|| {
+    MESH.get_or_init(|| {
         let raw = std::env::var("VICTORY_PRODUCER_MESH").ok()?;
         let mut hashes = crate::pipeline::parse_shader_hashes(&raw);
         (hashes.len() == 1).then(|| hashes.remove(0))
-    }) else { return };
+    }).as_deref()
+}
+
+/// Select the first record of the first submitted indirect draw matching the
+/// mesh shader. The address stays fixed for the rest of this title process.
+pub(crate) fn select_mesh(pipeline: crate::object::This, arguments: u64, stride: u32, max: u32) {
+    let Some(hash) = mesh_selector() else { return };
     if word().is_none() && arguments.is_multiple_of(4) && arguments.checked_add(3).is_some()
         && record_index(arguments, stride, max, arguments).is_some()
         && crate::pipeline::has_shader(pipeline, hash)
@@ -72,7 +76,8 @@ enum Event {
         samples: bool,
     },
     PackInput {
-        record: u32,
+        output: (u64, u64),
+        stride: u32,
         elements: u32,
         back: ID3D12Resource,
     },
@@ -94,6 +99,7 @@ struct Recording {
     id: u64,
     events: Vec<Event>,
     omitted: u32,
+    pack_inputs: u32,
 }
 
 #[derive(Default)]
@@ -110,18 +116,21 @@ pub(crate) struct Sample {
 
 impl Journal {
     pub(crate) fn reset(&self) {
-        if word().is_none() {
+        if word().is_none() && mesh_selector().is_none() {
             return;
         }
         let mut r = self.records.lock().unwrap_or_else(|e| e.into_inner());
         r.events.clear();
         r.omitted = 0;
+        r.pack_inputs = 0;
         r.id = 0;
     }
 
     fn add(&self, event: Event) -> Option<usize> {
         let mut r = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        if r.events.len() == LIMIT {
+        let pack_input = matches!(&event, Event::PackInput { .. });
+        // At most 32 small committed readbacks per command-list recording.
+        if r.events.len() == LIMIT || (pack_input && r.pack_inputs >= 32) {
             r.omitted = r.omitted.saturating_add(1);
             return None;
         }
@@ -129,6 +138,7 @@ impl Journal {
             r.id = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
         }
         let index = r.events.len();
+        r.pack_inputs += u32::from(pack_input);
         r.events.push(event);
         Some(index)
     }
@@ -207,13 +217,13 @@ impl Journal {
 
     /// Capture the packed source indices that this direct dispatch can actually read.
     /// The unsigned index is encoded in the low 29 bits, the shift in the high three.
-    pub(crate) fn pack_input(list: &HostList, source: (u64, u64), elements: u32, record: u32) {
+    pub(crate) fn pack_input(list: &HostList, source: (u64, u64), elements: u32, output: (u64, u64), stride: u32) {
         let bytes = u64::from(elements) * 4;
         if elements == 0 || elements > 16384 || bytes > source.1 { return; }
         let Some(shadow) = crate::shadow::find(source.0, bytes) else { return };
         let Some(bound) = list.bound_buffer_state(&shadow.buffer) else { return };
         let Some(back) = crate::host::readback_buffer(bytes) else { return };
-        if list.producers.add(Event::PackInput { record, elements, back: back.clone() }).is_none() { return; }
+        if list.producers.add(Event::PackInput { output, stride, elements, back: back.clone() }).is_none() { return; }
         list.buffer_state(&shadow.buffer, BUFFER_READ);
         // SAFETY: both buffers cover the validated range. Binding retains the source
         // until execution and the journal owns the readback until list reset.
@@ -291,12 +301,16 @@ impl Journal {
                     tracing::info!(fence, list_index, recording=r.id, order, address=format_args!("{address:#x}"),
                         shader, range=?range, status, ?buffer, ?before, ?after, ?changed, "indirect X producer candidate");
                 }
-                Event::PackInput { record, elements, back } => {
+                Event::PackInput { output, stride, elements, back } => {
+                    if !covers(output.0, output.1, address) { continue; }
+                    let offset = address - output.0;
+                    if !offset.is_multiple_of(u64::from(*stride)) { continue; }
+                    let Ok(record) = u32::try_from(offset / u64::from(*stride)) else { continue };
                     let mut data = std::ptr::null_mut();
                     let hits = if unique_completed && unsafe { back.Map(0, None, Some(&mut data)) }.is_ok() && !data.is_null() {
                         // SAFETY: the fence completed and the copy covered this many u32s.
                         let words = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), *elements as usize) };
-                        let hits = words.iter().filter(|word| **word & 0x1fff_ffff == *record).count();
+                        let hits = words.iter().filter(|word| **word & 0x1fff_ffff == record).count();
                         unsafe { back.Unmap(0, None) };
                         Some(hits)
                     } else { None };

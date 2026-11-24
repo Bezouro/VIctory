@@ -296,4 +296,7 @@ For a matching direct PackInstances dispatch, the indirect probe also copies
 the active source indices from SRV 83 before dispatch and counts references
 to the selected UAV 8 record after its fence completes. This measurement
 requires a valid stride, a tracked source buffer, a one-dimensional dispatch
-and at most 16,384 active inputs. An unavailable readback has no hit count.
+and at most 16,384 active inputs. Up to 32 such dispatches per recording
+can be captured before the mesh address is learned. Range matching uses the
+address available at submission completion. An unavailable readback has no
+hit count.
