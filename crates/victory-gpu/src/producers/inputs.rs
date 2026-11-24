@@ -1,5 +1,8 @@
 //! Fence-completed BatchCull groups and PackInstances counters. The mesh draw can
 //! first expose its indirect X address after these dispatches were recorded.
+mod dispatch;
+pub(crate) use dispatch::Dispatch;
+use dispatch::Plan;
 mod pack;
 pub(crate) use pack::{AfterPack, before_pack};
 
@@ -21,7 +24,7 @@ struct Layout {
 enum Kernel {
     Batch {
         group_base: u32,
-        dispatched: u32,
+        plan: Plan,
         records: u32,
         table_words: u32,
     },
@@ -66,8 +69,9 @@ impl Input {
             Kernel::Batch {
                 records,
                 table_words,
+                plan,
                 ..
-            } => u64::from(records) * 16 + u64::from(table_words) * 4,
+            } => u64::from(records) * 16 + u64::from(table_words) * 4 + plan.bytes(),
             Kernel::Pack {
                 elements,
                 counter_words,
@@ -166,11 +170,18 @@ pub(super) fn select(x: u64) {
 }
 
 impl Snapshot {
-    fn batch_evidence(&self, records: u32, record: u32) -> Evidence {
-        let (groups, table) = self.words.split_at(records as usize * 4);
+    fn batch_evidence(
+        &self,
+        records: u32,
+        table_words: u32,
+        executed_x: u32,
+        record: u32,
+    ) -> Evidence {
+        let (groups, rest) = self.words.split_at(records as usize * 4);
+        let table = &rest[..table_words as usize];
         let mut hit_groups = Vec::new();
         let mut hits = 0;
-        for (group, data) in groups.chunks_exact(4).enumerate() {
+        for (group, data) in groups.chunks_exact(4).take(executed_x as usize).enumerate() {
             let [a, b, c, d] = *data else { unreachable!() };
             if batch_index(b, c) == record {
                 hits += 1;
@@ -194,15 +205,28 @@ impl Snapshot {
             (self.fence, self.list_index, self.recording, self.order);
         let Kernel::Batch {
             group_base,
-            dispatched,
+            plan,
             records,
-            ..
+            table_words,
         } = self.layout.kernel
         else {
             self.report_pack(record);
             return;
         };
-        let e = self.batch_evidence(records, record);
+        let arguments = &self.words[(u64::from(records) * 4 + u64::from(table_words)) as usize..];
+        let coverage = plan.coverage(arguments);
+        let e = self.batch_evidence(records, table_words, coverage.unique_x, record);
+        if let Plan::Indirect {
+            guest_kind,
+            stride,
+            max,
+            counted,
+        } = plan
+        {
+            tracing::info!(fence,list_index,recording,order,record,guest_kind,host_kind=2,stride,max,counted,
+                count=?coverage.count,commands=coverage.commands,groups=coverage.groups,unique_x=coverage.unique_x,
+                first_dimensions=?coverage.first_dimensions,"submitted BatchCull indirect arguments");
+        }
         for (group, [a, b, c, d]) in e.hit_groups {
             tracing::info!(fence, list_index, recording, order, record, group,
                 source_record=u64::from(group_base)+u64::from(group),
@@ -211,7 +235,7 @@ impl Snapshot {
                 instance_base=d & 0xffff, "submitted BatchCull input group");
         }
         tracing::info!(fence, list_index, recording, order, record, hits=e.hits,
-            dispatched, captured=records, t79=?e.tile,
+            dispatched=coverage.unique_x, captured=records.min(coverage.unique_x), staged=records, t79=?e.tile,
             sentinel=e.tile.map(|v|v==u32::MAX), "submitted BatchCull input membership");
     }
 }
@@ -246,19 +270,24 @@ pub(crate) fn batch(
     t79: Range,
     output: Range,
     base: u32,
-    groups: u32,
+    dispatch: Dispatch<'_>,
     stride: u32,
 ) {
-    if stride == 0 || groups == 0 || output.1 < 4 {
+    let Some(plan) = dispatch.plan() else { return };
+    if stride == 0 || output.1 < 4 {
         return;
     }
     let first = u64::from(base) * 16;
     if first >= t82.1 {
         return;
     }
-    let records = u64::from(groups).min((t82.1 - first) / 16);
+    let reach = match plan {
+        Plan::Direct(g) => g[0],
+        Plan::Indirect { .. } => 65535,
+    };
+    let records = u64::from(reach).min((t82.1 - first) / 16);
     let table_words = (t79.1 / 4).min(1 + (output.1 - 4) / u64::from(stride));
-    let Some(bytes) = (records * 16).checked_add(table_words * 4) else {
+    let Some(bytes) = (records * 16 + plan.bytes()).checked_add(table_words * 4) else {
         return;
     };
     if records == 0 || table_words == 0 || bytes > BUDGET {
@@ -289,7 +318,7 @@ pub(crate) fn batch(
             stride,
             kernel: Kernel::Batch {
                 group_base: base,
-                dispatched: groups,
+                plan,
                 records: records as u32,
                 table_words: table_words as u32,
             },
@@ -298,6 +327,7 @@ pub(crate) fn batch(
     if list.producers.add(Event::GeometryInput(event)).is_none() {
         return;
     }
+    dispatch.capture(list, &back, records * 16 + table_words * 4, plan);
     for (src, guest, len, dest, state) in [
         (records_buffer, start, records * 16, 0, record_state),
         (
@@ -370,7 +400,7 @@ mod tests {
             (start + t79_word as u64 * 4, 1232 * 4),
             (0x6615c00, 0x5ae0),
             1,
-            2,
+            Dispatch::Direct([2, 1, 1]),
             16,
         );
         list.close();
@@ -387,11 +417,121 @@ mod tests {
         pending.push(input.snapshot(1, 0, 1, 0).unwrap());
         let snap = pending.inputs.pop_front().unwrap();
         let record = output_record(snap.layout.output, snap.layout.stride, 0x661a8f0).unwrap();
-        let hit = snap.batch_evidence(2, record);
+        let hit = snap.batch_evidence(2, 1232, 2, record);
         assert_eq!(hit.hits, 1);
         assert_eq!(hit.hit_groups, [(1, expected)]);
         assert_eq!(hit.tile, Some(0xfedc_0001));
-        assert_eq!(snap.batch_evidence(2, 207).hits, 0);
+        assert_eq!(snap.batch_evidence(2, 1232, 2, 207).hits, 0);
         crate::shadow::unregister(key, start);
+    }
+
+    #[test]
+    fn fenced_indirect_batch_uses_post_clamp_dimensions_and_the_gpu_count() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let fixture = [0u32; 64];
+        let base = fixture.as_ptr() as u64;
+        let len = std::mem::size_of_val(&fixture) as u64;
+        let key = base as usize;
+        crate::shadow::register(key, base, len);
+        let shadow = crate::shadow::find(base, len).unwrap();
+        let mut p = std::ptr::null_mut();
+        unsafe { shadow.buffer.Map(0, None, Some(&mut p)).unwrap() };
+        let ptr = unsafe {
+            p.cast::<u8>()
+                .add(shadow.offset(base) as usize)
+                .cast::<u32>()
+        };
+        // t82 starts at record 1. Records 0 and 3 also name tile 9, but
+        // record 0 cannot participate, and record 3 needs at least 3 groups.
+        let mut data = [0u32; 64];
+        for record in [0, 1, 3] {
+            data[record * 4 + 1] = 9 << 22;
+        }
+        data[32 + 9] = u32::MAX;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            shadow.buffer.Unmap(0, None)
+        };
+        let (args, ap) = host.shared_buffer(128).unwrap();
+        let va = unsafe { args.GetGPUVirtualAddress() };
+        for (count, expected_records, expected_x, hits) in [
+            (0, 0, 0, 0),
+            (1, 1, 1, 1),
+            (2, 2, 65535, 2),
+            (99, 2, 65535, 2),
+        ] {
+            // Padding resembles arguments; stride is 32, not 12.
+            let values = [1, 1, 1, 77, 77, 77, 77, 77, 80000, 1, 1];
+            unsafe {
+                std::ptr::copy_nonoverlapping(values.as_ptr(), ap.cast::<u32>(), values.len());
+                ap.cast::<u32>().add(16).write(count);
+            }
+            let list = host.new_list().unwrap();
+            list.buffer_state(&shadow.buffer, BUFFER_READ);
+            assert!(crate::indirect::bound(
+                &list,
+                &args,
+                va,
+                (2, 32, 2),
+                Some((&args, va + 64))
+            ));
+            let pre_state = list.bound_buffer_state(&args);
+            batch(
+                &list,
+                (base, 64),
+                (base + 128, 64),
+                (0x1000, 160),
+                1,
+                Dispatch::Indirect {
+                    guest_kind: 105,
+                    stride: 32,
+                    max: 2,
+                    args: (&args, 0),
+                    count: Some((&args, 64)),
+                },
+                16,
+            );
+            assert_eq!(list.bound_buffer_state(&args), pre_state);
+            list.close();
+            host.execute(&[&list]);
+            let r = list
+                .producers
+                .records
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let [Event::GeometryInput(input)] = r.events.as_slice() else {
+                panic!("missing indirect capture")
+            };
+            let snap = input.snapshot(1, 0, 1, 0).unwrap();
+            let Kernel::Batch {
+                records,
+                table_words,
+                plan,
+                ..
+            } = snap.layout.kernel
+            else {
+                panic!("expected BatchCull")
+            };
+            let c = plan.coverage(&snap.words[(records * 4 + table_words) as usize..]);
+            assert_eq!(
+                (c.count, c.commands, c.unique_x),
+                (Some(count), expected_records, expected_x)
+            );
+            assert_eq!(c.first_dimensions.len(), expected_records as usize);
+            assert_eq!(
+                c.first_dimensions.last().copied(),
+                match count {
+                    0 => None,
+                    1 => Some([1, 1, 1]),
+                    _ => Some([65535, 1, 1]),
+                }
+            );
+            let e = snap.batch_evidence(records, table_words, c.unique_x, 9);
+            assert_eq!(e.hits, hits);
+            assert_eq!(e.tile, Some(u32::MAX));
+        }
+        crate::shadow::unregister(key, base);
     }
 }

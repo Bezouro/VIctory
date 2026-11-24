@@ -839,14 +839,15 @@ impl State {
     }
 
     #[cfg(feature = "diagnostics")]
-    fn sample_batch_input(&self, list: &HostList, p: &HostPipeline, groups: [u32; 3]) {
-        if p.name != "[compute 4fb416369fc50b6e]" || groups[1..] != [1, 1] {
+    fn sample_batch_input(&self, list: &HostList, p: &HostPipeline, dispatch:crate::producers::inputs::Dispatch<'_>) {
+        if p.name != "[compute 4fb416369fc50b6e]" {
             return;
         }
         let word = crate::producers::word();
         if word.is_none() && crate::producers::mesh_selector().is_none() {
             return;
         }
+        dispatch.note_signature();
         let Some(Root::Constants(c)) = self.compute.get(1) else {
             return;
         };
@@ -869,7 +870,7 @@ impl State {
                 tiles,
                 out,
                 *base,
-                groups[0],
+                dispatch,
                 flags & 0x03ff_ffff,
             );
         }
@@ -948,7 +949,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let pack = self.sample_pack_input(list, p, [x, y, z]);
         #[cfg(feature = "diagnostics")]
-        self.sample_batch_input(list, p, [x, y, z]);
+        self.sample_batch_input(list, p, crate::producers::inputs::Dispatch::Direct([x,y,z]));
         #[cfg(feature = "diagnostics")]
         let query = crate::capture::MeshStats::begin_compute(list, &p.name, Some([x, y, z]));
         #[cfg(feature = "diagnostics")]
@@ -1430,10 +1431,12 @@ impl State {
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
-        (kind, stride, max): (u32, u32, u32),
+        (guest_kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // Xbox DISPATCH_SINGLE (105) uses the same host argument as DISPATCH (2).
+        let kind = if guest_kind == 105 { 2 } else { guest_kind };
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -1549,6 +1552,13 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         let producer = (kind == DISPATCH).then(|| self.sample_producer(list)).flatten();
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH {
+            self.sample_batch_input(list,p,crate::producers::inputs::Dispatch::Indirect {
+                guest_kind,stride,max,args:(&args.buffer,args.offset(arguments)),
+                count:counter.as_ref().map(|(s,at)|(&s.buffer,s.offset(*at))),
+            });
+        }
         crate::indirect::execute(
             list,
             &signature,
