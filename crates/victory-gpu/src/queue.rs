@@ -253,7 +253,7 @@ extern "win64" fn present(
     #[cfg(feature = "diagnostics")]
     let scene = crate::capture::take_scene(frame);
     #[cfg(feature = "diagnostics")]
-    crate::validation::log(frame);
+    crate::validation::log(frame, None);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         let (drawn, dispatched) = {

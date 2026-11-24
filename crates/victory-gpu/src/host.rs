@@ -1187,9 +1187,16 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         if unsafe { self.fence.GetCompletedValue() } >= *submitted {
+            let mut selected = false;
             for list in runs {
-                if crate::validation::enabled() { list.validation.lock().unwrap_or_else(|e| e.into_inner()).completed(); }
+                if crate::validation::enabled() {
+                    selected |= list.validation.lock().unwrap_or_else(|e| e.into_inner()).completed();
+                }
                 if let Some(Some(stats)) = list.mesh_stats.get() { stats.report(); }
+            }
+            if selected {
+                // A long world submission may finish before its frame is presented.
+                crate::validation::log(crate::queue::presented() + 1, Some(*submitted));
             }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,

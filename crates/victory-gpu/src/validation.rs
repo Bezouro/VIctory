@@ -38,14 +38,15 @@ pub(crate) fn compute(ran: bool) {
     }
 }
 
-pub(crate) fn log(frame: u64) {
+pub(crate) fn log(frame: u64, completed_fence: Option<u64>) {
     if enabled() {
+        let checkpoint = if completed_fence.is_some() { "selected pass counters" } else { "render validation" };
         tracing::info!(frame, compute_requested = COMPUTE_REQUESTED.load(Relaxed),
             compute_dropped = COMPUTE_DROPPED.load(Relaxed), compute_pending = PENDING_MISSES.load(Relaxed),
             compute_unavailable = FAILED_MISSES.load(Relaxed), first_binds = FIRST_BINDS.load(Relaxed),
             ready_before_bind = READY_BEFORE_BIND.load(Relaxed), draws_completed = COMPLETED.load(Relaxed),
             draws_measured = MEASURED.load(Relaxed), draws_active = ACTIVE.load(Relaxed),
-            draws_shaded = SHADED.load(Relaxed), "render validation");
+            draws_shaded = SHADED.load(Relaxed), ?completed_fence, "{checkpoint}");
     }
 }
 
@@ -110,7 +111,8 @@ impl Draws {
         }
     }
 
-    pub(crate) fn completed(&mut self) {
+    /// True if this list contains a selected pass with a recorded query.
+    pub(crate) fn completed(&mut self) -> bool {
         COMPLETED.fetch_add(u64::from(self.count), Relaxed);
         for (page, storage) in self.pages.iter().take(self.count.div_ceil(PAGE) as usize).enumerate() {
             let Some((_, back)) = storage else { continue };
@@ -143,6 +145,7 @@ impl Draws {
         // A reusable command list keeps the buffers named by its copy commands
         // alive until reset. Save the first execution only.
         for image in &mut self.captures { image.save_once(); }
+        !self.selected.is_empty()
     }
 }
 

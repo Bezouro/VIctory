@@ -272,8 +272,10 @@ Run per-mesh sampling separately from full render validation, which uses the sam
 
 With `VICTORY_VALIDATE=1`, each present logs cumulative counts of compute
 calls requested and discarded, pipeline objects ready at first guest bind,
-and graphics calls on fence-completed command lists. Each graphics call also
-receives a pipeline-statistics query. Active counts calls with vertex, clipper
+and graphics calls on fence-completed command lists. A submission containing a selected comparison pass also logs cumulative counters
+at fence completion, even when the frame has yet to present. These entries
+use the message `selected pass counters` and identify the completed fence.
+Each graphics call also receives a pipeline-statistics query. Active counts calls with vertex, clipper
 or fragment invocations. Shaded counts those with fragment invocations.
 Each ExecuteIndirect counts as one API call and may execute multiple records.
 A mesh group that emits nothing can remain invisible to the legacy counters.
