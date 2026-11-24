@@ -763,7 +763,8 @@ fn root_srv_loads_past_the_length_the_host_passes_read_zero() {
                 RootType::Constants => [offset, 0, 0, 0][u.dword as usize],
                 RootType::Table => 0,
                 RootType::Descriptor => 4 * data.len() as u32,
-                other => panic!("unexpected user data {other:?}"),
+                other => super::host::guard(other, 1, 0)
+                    .unwrap_or_else(|| panic!("unexpected user data {other:?}")),
             };
         }
         let out = host
