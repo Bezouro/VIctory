@@ -2763,6 +2763,24 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// Neighboring lanes can update different fields of one shared dword.
+    /// Retry with the observed word to preserve the other lanes' stores.
+    fn store_lds_field(&mut self, ptr: V, keep: V, value: V) {
+        let zero = self.s.m.i32(0);
+        let head = self.cur;
+        let retry = self.s.m.new_block();
+        let done = self.s.m.new_block();
+        self.s.m.terminate(head, Term::Br(retry));
+        let expected = self.s.m.phi(retry, self.s.t.i32);
+        let other = self.s.m.bin(retry, Bin::And, expected, keep);
+        let merged = self.s.m.bin(retry, Bin::Or, other, value);
+        let old = self.s.m.cmpxchg(retry, ptr, expected, merged);
+        self.s.m.set_phi(expected, vec![(zero, head), (old, retry)]);
+        let stored = self.s.m.cmp(retry, pred::EQ, old, expected);
+        self.s.m.terminate(retry, Term::CondBr(stored, done, retry));
+        self.cur = done;
+    }
+
     /// LDS (thread-group shared memory) and `ds_swizzle`.
     fn ds(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Ds {
@@ -2900,6 +2918,68 @@ impl<'a> Lower<'a> {
                 .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
+        let bits = match name {
+            "ds_write_b8" | "ds_read_u8" | "ds_read_i8" => 8,
+            "ds_write_b16" | "ds_read_u16" | "ds_read_i16" => 16,
+            _ => 0,
+        };
+        if bits != 0 {
+            let offset = self.s.m.i32(offset);
+            let address = self.s.m.bin(self.cur, Bin::Add, a, offset);
+            let zero = self.s.m.i32(0);
+            let two = self.s.m.i32(2);
+            let index = self.s.m.bin(self.cur, Bin::LShr, address, two);
+            let limit = self.s.m.i32(self.s.lds_dwords);
+            let mut valid = self.s.m.cmp(self.cur, pred::IULT, index, limit);
+            if bits == 16 {
+                let one = self.s.m.i32(1);
+                let low = self.s.m.bin(self.cur, Bin::And, address, one);
+                let aligned = self.s.m.cmp(self.cur, pred::EQ, low, zero);
+                valid = self.s.m.bin(self.cur, Bin::And, valid, aligned);
+            }
+            let three = self.s.m.i32(3);
+            let byte = self.s.m.bin(self.cur, Bin::And, address, three);
+            let shift = self.s.m.bin(self.cur, Bin::Shl, byte, three);
+            let mask = self.s.m.i32((1 << bits) - 1);
+            let lds = self.s.lds();
+            if name.starts_with("ds_write") {
+                let x = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                let enabled = guard.map_or(valid, |g| self.s.m.bin(self.cur, Bin::And, g, valid));
+                let at = self.begin_guarded(Some(enabled));
+                let ptr = self.s.m.element(self.cur, lds, index);
+                let field = self.s.m.bin(self.cur, Bin::And, x, mask);
+                let value = self.s.m.bin(self.cur, Bin::Shl, field, shift);
+                let occupied = self.s.m.bin(self.cur, Bin::Shl, mask, shift);
+                let ones = self.s.m.i32(u32::MAX);
+                let keep = self.s.m.bin(self.cur, Bin::Xor, occupied, ones);
+                self.store_lds_field(ptr, keep, value);
+                self.end_guarded(at, &[]);
+            } else {
+                let safe_index = self.s.m.select(self.cur, valid, index, zero);
+                let ptr = self.s.m.element(self.cur, lds, safe_index);
+                // A neighbor can simultaneously store another byte in this word.
+                let word = self
+                    .s
+                    .m
+                    .atomic(self.cur, super::bitcode::Rmw::Or, ptr, zero);
+                let shifted = self.s.m.bin(self.cur, Bin::LShr, word, shift);
+                let x = if name.starts_with("ds_read_i") {
+                    let padding = self.s.m.i32(32 - bits);
+                    let high = self.s.m.bin(self.cur, Bin::Shl, shifted, padding);
+                    self.s.m.bin(self.cur, Bin::AShr, high, padding)
+                } else {
+                    self.s.m.bin(self.cur, Bin::And, shifted, mask)
+                };
+                let value = self.s.m.select(self.cur, valid, x, zero);
+                self.write(
+                    inst,
+                    Reg::V(dst_reg.ok_or("an LDS read result")?),
+                    value,
+                    guard,
+                );
+            }
+            return Ok(());
+        }
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
         let dword = |l: &mut Self, bytes: u32| -> V {

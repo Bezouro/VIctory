@@ -979,6 +979,76 @@ mod tests {
         super::emit(&c, native, &p, &st, &io, &res, target)
     }
 
+    #[test]
+    fn neighboring_lanes_share_packed_lds_words() {
+        use super::host::{Dispatch, Host, Root, View};
+        use crate::native::{RootParam, RootType};
+
+        let host = Host::new(false).ok();
+        for (bits, store, signed_load, unsigned_load) in [
+            (8, 0xD878_0000, 0xD8E4_0000, 0xD8E8_0000),
+            (16, 0xD87C_0000, 0xD8EC_0000, 0xD8F0_0000),
+        ] {
+            for (read, signed) in [(signed_load, true), (unsigned_load, false)] {
+                let scale = u32::from(bits == 16);
+                let words = [
+                    0xBE82_0300,
+                    0xBE83_0380, // s[2:3] = {s0, 0}
+                    0xF408_0101,
+                    0xFA00_0000,         // s_load_dwordx4 s[4:7], s[2:3], 0
+                    0x3408_0080 | scale, // v4 = lane * sizeof(field)
+                    0x4C0A_00C1,         // v5 = -1 - lane
+                    store | 8,
+                    0x0000_0504,         // store v5 at byte v4+8
+                    0xBF8A_0000,         // s_barrier
+                    0x3A0C_0081,         // v6 = lane ^ 1
+                    0x340C_0C80 | scale, // v6 *= sizeof(field)
+                    read | 8,
+                    0x0200_0006, // load neighbor into v2
+                    0x3406_0082, // v3 = lane * 4
+                    0xE070_1000,
+                    0x8001_0203, // buffer_store_dword v2, v3, s[4:7], 0 offen
+                    0xBF81_0000, // s_endpgm
+                ];
+                let mut native = compute(&words, false);
+                let StageIo::Cs(io) = &mut native.io else {
+                    unreachable!()
+                };
+                io.rsrc2 = 1 << 1 | 1 << 15; // one user SGPR and an LDS allocation
+                native.layout.push(RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                });
+                let cs = emit_for(&native, host.as_ref().map_or(NVIDIA, Host::target)).unwrap();
+                let Some(host) = &host else { continue };
+                let (root, pso) = host.compute_pipeline(&cs).unwrap();
+                let result = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(
+                                0,
+                                Root::Constants(vec![0; cs.user_data_dwords().max(1) as usize]),
+                            )],
+                            views: &[View::RawUav(64)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                let mask = if signed { u32::MAX } else { (1 << bits) - 1 };
+                let expected: Vec<_> = (0..64u32).map(|lane| !(lane ^ 1) & mask).collect();
+                assert_eq!(result[0], expected, "bits={bits}, signed={signed}");
+                eprintln!("GPU packed LDS {bits}-bit signed={signed}: 64 lanes matched");
+            }
+        }
+    }
+
     const NVIDIA: Target = Target {
         lanes_min: 32,
         lanes_max: 32,
