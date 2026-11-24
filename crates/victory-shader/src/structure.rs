@@ -239,22 +239,32 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        self.meet_in(all.to_vec(), &mut budget, &mut Map::default())
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+    fn meet_in(
+        &self,
+        mut all: Vec<(Bool, bool)>,
+        budget: &mut usize,
+        impossible: &mut Map<Vec<(Bool, bool)>, ()>,
+    ) -> bool {
         let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
         if all.iter().any(fails) {
             return false;
         }
         all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        all.sort_unstable();
+        all.dedup();
+        if all.windows(2).any(|w| w[0].0 == w[1].0) || impossible.contains_key(&all) {
+            return false;
+        }
         if all.is_empty() || *budget == 0 {
             return true;
         }
         *budget -= 1;
         let top = |b: Bool| self.nodes[b.0 as usize].0;
         let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let possible = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
                 .map(|&(b, holds)| {
@@ -262,8 +272,14 @@ impl Bools {
                     (if value { hi } else { lo }, holds)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, impossible)
+        });
+        // Shared BDD tails can be reached through exponentially many assignments.
+        // Cache only proven contradictions, keeping the conservative budget fallback.
+        if !possible && impossible.len() < 4096 {
+            impossible.insert(all, ());
+        }
+        possible
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -1173,6 +1189,23 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    #[test]
+    fn complementary_descriptor_paths_stay_exclusive_under_shared_conditions() {
+        let mut bools = Bools::new();
+        let mut active = Bool::FALSE;
+        // The same two parity tails recur exponentially often if explored as a tree.
+        for i in 0..20 {
+            let input = bools.atom(Atom::Lane(Value(i)), 0);
+            active = bools.xor(active, input);
+        }
+        let choose = bools.atom(Atom::Lane(Value(20)), 0);
+        let first = bools.and(active, choose);
+        let remaining = bools.not(first);
+        let second = bools.and(active, remaining);
+        assert!(!bools.meet(&[(active, true), (first, false), (second, false)]));
+        assert!(bools.meet(&[(active, true), (first, false), (second, true)]));
     }
 
     #[test]
