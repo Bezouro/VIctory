@@ -393,6 +393,10 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
+        self.prepare_graphics(list, p, indexed)
+    }
+
+    fn prepare_graphics(&mut self, list: &HostList, p: &HostPipeline, indexed: bool) -> bool {
         if !self.bind(list, p, false) {
             return false;
         }
@@ -1138,6 +1142,21 @@ impl State {
             why("no host signature");
             return false;
         };
+        // The clamp writes argument records and consumes the list's work
+        // budget. A pipeline still being compiled cannot use either.
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        };
+        if p.compute != (kind == DISPATCH) || p.mesh != (kind == MESH) {
+            why("pipeline kind does not match indirect command");
+            return false;
+        }
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
+            why("rectangle topology");
+            return false;
+        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
@@ -1149,21 +1168,13 @@ impl State {
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
-        let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
-            },
-            _ => false,
+        let ran = if p.compute {
+            self.bind(list, p, true)
+        } else {
+            self.prepare_graphics(list, p, kind == INDEXED)
         };
         if !ran {
-            #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
-            }
+            why("binding failed");
             return false;
         }
         #[cfg(feature = "diagnostics")]
