@@ -304,3 +304,7 @@ and at most 16,384 active inputs. Up to 32 such dispatches per recording
 can be captured before the mesh address is learned. Range matching uses the
 address available at submission completion. An unavailable readback has no
 hit count.
+
+Two-channel R16G16_FLOAT targets are written as DDS files with their native
+half-float samples. Each row contains only texels, with GPU pitch padding
+removed. A typeless R16G16 resource uses this path when its RTV is R16G16_FLOAT.

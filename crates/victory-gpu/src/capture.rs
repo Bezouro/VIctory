@@ -337,17 +337,19 @@ pub(crate) struct PassImage {
     name: String,
     buffer: ID3D12Resource,
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    rg16_float: bool,
     saved: bool,
 }
 
 impl PassImage {
-    pub(crate) fn record(list: &crate::host::HostList, target: usize, hash: &str, occurrence: u64, slot: usize) -> Option<Self> {
+    pub(crate) fn record(list: &crate::host::HostList, target: usize, hash: &str, occurrence: u64, slot: usize, view_format: Option<i32>) -> Option<Self> {
         folder()?;
         let target = target as crate::object::This;
         let texture = crate::resource::host_resource(target)?;
         let desc = unsafe { texture.GetDesc() };
+        let rg16_float = desc.Format.0 == 34 || (desc.Format.0 == 33 && view_format == Some(34));
         if desc.SampleDesc.Count != 1 || desc.MipLevels != 1 || desc.DepthOrArraySize != 1
-            || !matches!(desc.Format.0, 23..=25 | 27..=29 | 87 | 90 | 91)
+            || (!rg16_float && !matches!(desc.Format.0, 23..=25 | 27..=29 | 87 | 90 | 91))
         {
             return None;
         }
@@ -357,7 +359,7 @@ impl PassImage {
         crate::list::ensure_state(list, target, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
         let (buffer, footprint) = read?;
         let name = format!("pass-{hash}-{occurrence}-slot-{slot}-{}x{}-f{}", desc.Width, desc.Height, desc.Format.0);
-        Some(Self { name, buffer, footprint, saved: false })
+        Some(Self { name, buffer, footprint, rg16_float, saved: false })
     }
 
     pub(crate) fn save_once(&mut self) {
@@ -372,9 +374,10 @@ impl PassImage {
         let raw = unsafe {
             if self.buffer.Map(0, None, Some(&mut data)).is_err() { return; }
             let mut raw = Vec::with_capacity((f.Width as usize * if packed { 8 } else { 4 } + 1) * f.Height as usize);
+            if self.rg16_float { rg16_dds_header(&mut raw, f.Width, f.Height); }
             let start = data.cast::<u8>().add(self.footprint.Offset as usize);
             for y in 0..f.Height as usize {
-                raw.push(0);
+                if !self.rg16_float { raw.push(0); }
                 let row = std::slice::from_raw_parts(start.add(y * f.RowPitch as usize), f.Width as usize * 4);
                 if packed {
                     for pixel in row.chunks_exact(4) {
@@ -394,17 +397,34 @@ impl PassImage {
             self.buffer.Unmap(0, None);
             raw
         };
-        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-        let mut header = Vec::from(f.Width.to_be_bytes());
-        header.extend(f.Height.to_be_bytes());
-        header.extend([if packed { 16 } else { 8 }, 6, 0, 0, 0]);
-        chunk(&mut png, b"IHDR", &header);
-        chunk(&mut png, b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 1));
-        chunk(&mut png, b"IEND", &[]);
-        match std::fs::write(dir.join(format!("{}.png", self.name)), png) {
+        let (extension, bytes) = if self.rg16_float {
+            ("dds", raw)
+        } else {
+            let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+            let mut header = Vec::from(f.Width.to_be_bytes());
+            header.extend(f.Height.to_be_bytes());
+            header.extend([if packed { 16 } else { 8 }, 6, 0, 0, 0]);
+            chunk(&mut png, b"IHDR", &header);
+            chunk(&mut png, b"IDAT", &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 1));
+            chunk(&mut png, b"IEND", &[]);
+            ("png", png)
+        };
+        match std::fs::write(dir.join(format!("{}.{extension}", self.name)), bytes) {
             Ok(()) => { self.saved = true; tracing::info!(name = %self.name, "completed draw target saved"); }
             Err(error) => tracing::warn!(%error, name = %self.name, "failed to save draw target"),
         }
+    }
+}
+
+/// DDS with a DX10 header keeps the two binary16 channels bit for bit.
+fn rg16_dds_header(bytes: &mut Vec<u8>, width: u32, height: u32) {
+    bytes.extend_from_slice(b"DDS ");
+    let dimensions = [124, 0x100f, height, width, width * 4, 0, 0];
+    let pixel_format = [32, 4, u32::from_le_bytes(*b"DX10"), 0, 0, 0, 0, 0];
+    let texture_caps = [0x1000, 0, 0, 0, 0];
+    let dx10 = [34, 3, 0, 1, 0]; // R16G16_FLOAT, TEXTURE2D, one array element.
+    for field in dimensions.into_iter().chain([0; 11]).chain(pixel_format).chain(texture_caps).chain(dx10) {
+        bytes.extend_from_slice(&field.to_le_bytes());
     }
 }
 
@@ -971,6 +991,19 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rg16_dds_declares_unpadded_rows_and_two_half_float_channels() {
+        let mut header = Vec::new();
+        super::rg16_dds_header(&mut header, 7, 3);
+        assert_eq!(header.len(), 148);
+        assert_eq!(&header[0..4], b"DDS ");
+        let field = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+        assert_eq!((field(4), field(12), field(16), field(20)), (124, 3, 7, 28));
+        assert_eq!(field(76), 32);
+        assert_eq!(&header[84..88], b"DX10");
+        assert_eq!((field(128), field(132), field(140)), (34, 3, 1));
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

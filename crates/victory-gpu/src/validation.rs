@@ -108,7 +108,7 @@ impl Draws {
             if let Some(index) = query { d.selected.push((index, hash, occurrence)); }
             tracing::info!(hash, occurrence, frame = crate::queue::presented() + 1, ?view_formats, pipeline = %crate::pipeline::stage_names(pipeline), "matching comparison pass");
             for (slot, &target) in targets.iter().enumerate() {
-                if let Some(image) = crate::capture::PassImage::record(list, target, hash, occurrence, slot) {
+                if let Some(image) = crate::capture::PassImage::record(list, target, hash, occurrence, slot, view_formats.get(slot).copied()) {
                     d.captures.push(image);
                 }
             }
