@@ -121,7 +121,7 @@ pub struct Resources {
     /// argument table: SSA value, layout index, dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
     /// Read-only buffers selected directly from the resource heap by a
-    /// root constant. The host must populate these slots before the draw.
+    /// root constant or a dword in a bound table CBV.
     pub indexed_reads: Vec<IndexedRead>,
     pub waterfall: Waterfall,
 }
@@ -129,6 +129,8 @@ pub struct Resources {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexedRead {
     pub slot: u8,
+    /// None for a root constant, otherwise the CBV record in the root table.
+    pub table_offset_dwords: Option<u32>,
     pub dword: u32,
     pub byte_offset: u32,
 }
@@ -175,7 +177,14 @@ pub fn track_shader(
     let spilled = container
         .part(FourCC::RTS0)
         .is_some_and(|rts| root_spill::matches(native, rts.data));
-    track_layout(p, &native.layout, native.stage, lanes, spilled)
+    let mut resources = track_layout(p, &native.layout, native.stage, lanes, spilled)?;
+    resources.indexed_reads.retain(|read| {
+        read.table_offset_dwords.is_none_or(|offset| native.used.iter().any(|u| {
+            u.root == RootType::Table && u.kind == crate::ResourceType::Cbv
+                && u.slot == read.slot && u.table_offset_dwords == offset
+        }))
+    });
+    Ok(resources)
 }
 
 fn track_layout(
@@ -266,6 +275,7 @@ fn track_layout(
     }
     if layout.iter().any(|p| p.root == RootType::ResourceHeap) {
         let loads: std::collections::BTreeMap<_, _> = out.scalar.iter().copied().collect();
+        let mut traced = std::collections::BTreeSet::new();
         for d in &out.descriptors {
             let name = t.inst(d.site).name();
             if !["s_buffer_load", "buffer_load", "tbuffer_load"].iter().any(|prefix| name.starts_with(prefix)) {
@@ -278,7 +288,9 @@ fn track_layout(
                     && let Some(offset) = addr.dynamic
                 {
                     let bytes = addr.offset.wrapping_add(4 * u32::from(*first));
-                    t.trace_heap_indices(offset, bytes, &mut out.indexed_reads);
+                    if traced.insert((offset, bytes)) {
+                        t.trace_heap_indices(offset, bytes, &loads, &mut out.indexed_reads);
+                    }
                 }
             }
         }
@@ -498,7 +510,8 @@ impl<'a> Tracer<'a> {
 
     /// A resource-heap byte offset can select either of two descriptors
     /// across a branch, before or after multiplying the index by 32.
-    fn trace_heap_indices(&self, offset: Value, byte_offset: u32, reads: &mut Vec<IndexedRead>) {
+    fn trace_heap_indices(&self, offset: Value, byte_offset: u32,
+        loads: &std::collections::BTreeMap<Site, Address>, reads: &mut Vec<IndexedRead>) {
         let mut pending = vec![(offset, false)];
         let mut visited = std::collections::BTreeSet::new();
         while let Some((value, scaled)) = pending.pop() {
@@ -509,10 +522,12 @@ impl<'a> Tracer<'a> {
             if let Some((block, phi)) = self.phis[v.0 as usize] {
                 pending.extend(self.p.blocks[block].phis[phi].args.iter().map(|&arg| (arg, scaled)));
             } else if scaled {
-                if let Some((param, dword)) = self.inputs[v.0 as usize].and_then(|reg| self.param_of(reg))
-                    && self.layout[param].root == RootType::Constants
-                {
-                    let read = IndexedRead { slot: self.layout[param].slot, dword, byte_offset };
+                let source = self.param_value(v)
+                    .filter(|&(param, _)| self.layout[param].root == RootType::Constants)
+                    .map(|(param, dword)| (self.layout[param].slot, None, dword))
+                    .or_else(|| self.table_buffer_index(v, loads));
+                if let Some((slot, table_offset_dwords, dword)) = source {
+                    let read = IndexedRead { slot, table_offset_dwords, dword, byte_offset };
                     if !reads.contains(&read) {
                         reads.push(read);
                     }
@@ -521,6 +536,25 @@ impl<'a> Tracer<'a> {
                 pending.push((index, true));
             }
         }
+    }
+
+    /// An index read at a constant byte offset through a descriptor loaded
+    /// from a fixed table slot. Its actual view must be a CBV at bind time.
+    fn table_buffer_index(&self, value: Value, loads: &std::collections::BTreeMap<Site, Address>)
+        -> Option<(u8, Option<u32>, u32)> {
+        let site = self.defs[value.0 as usize]?;
+        let inst = self.inst(site);
+        if !inst.name().starts_with("s_buffer_load_dword") { return None; }
+        let Fields::Smem { base, offset, soffset, .. } = &inst.fields else { return None };
+        let Term::Const(extra) = self.term(inst, soffset)? else { return None };
+        let component = inst.writes.iter().position(|w| w.1 == value)? as u32;
+        let byte = extra.wrapping_add(*offset as u32).checked_add(component * 4)?;
+        let Source::Loaded { load, first } = self.descriptor(inst, base, site.0).ok()? else { return None };
+        let addr = loads.get(&load)?;
+        let param = self.layout.get(addr.param)?;
+        let record = addr.offset.checked_add(u32::from(first) * 4)?;
+        (param.root == RootType::Table && addr.dynamic.is_none() && record % 32 == 0 && byte % 4 == 0)
+            .then_some((param.slot, Some(record / 4), byte / 4))
     }
 
     /// The SOP2 operands of `v` if an `s_add` with one of `names` wrote it.
@@ -2036,6 +2070,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn heap_index_can_be_a_component_of_a_table_buffer_load() {
+        let mut table = param(Table, 4, 1);
+        table.slot = 1;
+        for (index, want) in [(32, 16), (33, 17)] {
+            let r = track_words(&[
+                0xBE85_0380, // high half of table address
+                0xBE87_0380, // high half of heap address
+                0xF408_0402, 0xFA00_0100, // load table descriptor at +256
+                0xF424_0808, 0xFA00_0040, // read s32:s33 at +64 from it
+                0x8F09_8500 | index, // selected dword * 32
+                0xF408_0303, 0x1200_0000, // heap descriptor at s9
+                0xF428_0706, 0xFA00_0070, // scalar header in selected buffer
+                S_ENDPGM,
+            ], &[table, param(ResourceHeap, 6, 1)], HwStage::Cs);
+            assert_eq!(r.indexed_reads, [IndexedRead {
+                slot: 1, table_offset_dwords: Some(64), dword: want, byte_offset: 0,
+            }]);
+        }
+    }
+
+    #[test]
     fn heap_indices_from_root_constants_in_a_merged_stage() {
         // User data starts at s8: the constant (index 6) is s14, the heap
         // (index 10) s18.
@@ -2054,7 +2109,7 @@ pub(crate) mod tests {
         );
         let index = r.params.iter().find(|p| p.1 == 0).unwrap().0;
         let shift = r.scalar[0].1.dynamic.unwrap();
-        assert_eq!(r.indexed_reads, [IndexedRead { slot: 0, dword: 0, byte_offset: 0 }]);
+        assert_eq!(r.indexed_reads, [IndexedRead { slot: 0, table_offset_dwords: None, dword: 0, byte_offset: 0 }]);
         assert_eq!(r.scalar[0].1.param, 1);
         // The computed term is the shifted constant, not the constant itself.
         assert_ne!(shift, index);

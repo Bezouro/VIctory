@@ -223,7 +223,10 @@ fn encode(s: &HostShader) -> Vec<u8> {
     }
     word(&mut out, s.indexed_reads.len() as u32);
     for r in &s.indexed_reads {
-        for value in [u32::from(r.slot), r.dword, r.byte_offset] { word(&mut out, value); }
+        // Previously the tag was just the root slot (0..255).
+        let tag = u32::from(r.slot) | if r.table_offset_dwords.is_some() { 1 << 8 } else { 0 };
+        for value in [tag, r.dword, r.byte_offset] { word(&mut out, value); }
+        if let Some(offset) = r.table_offset_dwords { word(&mut out, offset); }
     }
     word(&mut out, u32::from(s.stride_table));
     // Older cache entries end here; no writable root view was expressible.
@@ -288,8 +291,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let count = r.word()? as usize;
     let mut indexed_reads = Vec::with_capacity(count.min(256));
     for _ in 0..count {
+        let tag = r.word()?;
+        if tag > 0x1ff { return None; }
         indexed_reads.push(victory_shader::resource::IndexedRead {
-            slot: r.word()?.try_into().ok()?, dword: r.word()?, byte_offset: r.word()?,
+            slot: tag as u8, dword: r.word()?, byte_offset: r.word()?,
+            table_offset_dwords: if tag & 0x100 != 0 { Some(r.word()?) } else { None },
         });
     }
     let stride_table = r.word()? != 0;
@@ -331,7 +337,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
-            indexed_reads: vec![victory_shader::resource::IndexedRead { slot: 1, dword: 2, byte_offset: 32 }],
+            indexed_reads: vec![victory_shader::resource::IndexedRead { slot: 1, table_offset_dwords: Some(64), dword: 2, byte_offset: 32 }],
             stride_table: true,
             root_uavs: vec![1],
         }
@@ -421,6 +427,7 @@ mod tests {
         assert_eq!(decode(&bytes), Some(shader()));
         let mut old = shader();
         old.root_uavs.clear();
+        old.indexed_reads[0].table_offset_dwords = None;
         // The old VSH2 encoding stopped immediately after the stride flag.
         let legacy = encode(&old);
         assert_eq!(decode(&legacy[..legacy.len() - 4]), Some(old));
