@@ -1257,6 +1257,10 @@ fn buffer_srv(
         once!(
             offset,
             element,
+            format = desc.Format.0,
+            stride = buffer.StructureByteStride,
+            first = buffer.FirstElement,
+            count = buffer.NumElements,
             "buffer view not on an element of its host copy"
         );
         return None;
@@ -1329,7 +1333,15 @@ fn buffer_uav(
         };
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     } else {
-        once!(offset, element, "unordered buffer view not on an element of its host copy");
+        once!(
+            offset,
+            element,
+            format = desc.Format.0,
+            stride = buffer.StructureByteStride,
+            first = buffer.FirstElement,
+            count = buffer.NumElements,
+            "unordered buffer view not on an element of its host copy"
+        );
         return None;
     }
     if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
