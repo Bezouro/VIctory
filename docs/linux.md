@@ -284,3 +284,8 @@ The log identifies the complete pipeline and view formats. Eight-bit RGBA
 and BGRA targets preserve alpha in PNG. Packed RGB10A2 targets use a
 reversible mapping to 16-bit RGBA PNG. Readback is of the single-sample,
 single-subresource target at draw time and is saved after its fence signals.
+
+For a mesh draw whose guest addresses vary by run, set
+`VICTORY_PRODUCER_MESH` to one mesh shader hash. The first matching indirect
+draw selects the address of its first X argument for later compute samples
+and consumer reads. An explicit `VICTORY_PRODUCER_X` selects a fixed address.

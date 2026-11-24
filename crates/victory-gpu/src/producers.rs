@@ -8,9 +8,12 @@ use crate::host::{BUFFER_READ, BUFFER_WRITE, HostList};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use windows::core::Interface;
 
+// A capture can discover the address from the title's bindings in this run.
+static LEARNED: OnceLock<u64> = OnceLock::new();
+
 pub(crate) fn word() -> Option<u64> {
     static WORD: OnceLock<Option<u64>> = OnceLock::new();
-    *WORD.get_or_init(|| {
+    WORD.get_or_init(|| {
         let value = std::env::var("VICTORY_PRODUCER_X").ok()?;
         let parsed = u64::from_str_radix(value.trim().trim_start_matches("0x"), 16)
             .ok()
@@ -22,7 +25,25 @@ pub(crate) fn word() -> Option<u64> {
             );
         }
         parsed
-    })
+    }).or_else(|| LEARNED.get().copied())
+}
+
+/// Select the first record of the first submitted indirect draw matching the
+/// mesh shader. The address stays fixed for the rest of this title process.
+pub(crate) fn select_mesh(pipeline: crate::object::This, arguments: u64, stride: u32, max: u32) {
+    static MESH: OnceLock<Option<String>> = OnceLock::new();
+    let Some(hash) = MESH.get_or_init(|| {
+        let raw = std::env::var("VICTORY_PRODUCER_MESH").ok()?;
+        let mut hashes = crate::pipeline::parse_shader_hashes(&raw);
+        (hashes.len() == 1).then(|| hashes.remove(0))
+    }) else { return };
+    if word().is_none() && arguments.is_multiple_of(4) && arguments.checked_add(3).is_some()
+        && record_index(arguments, stride, max, arguments).is_some()
+        && crate::pipeline::has_shader(pipeline, hash)
+        && LEARNED.set(arguments).is_ok()
+    {
+        tracing::info!(hash, address = format_args!("{arguments:#x}"), "selected terrain indirect X");
+    }
 }
 
 pub(crate) fn covers(start: u64, bytes: u64, address: u64) -> bool {

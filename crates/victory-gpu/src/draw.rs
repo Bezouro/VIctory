@@ -1354,6 +1354,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let validation = if kind == DISPATCH { None } else { crate::validation::Draws::begin(list) };
         #[cfg(feature = "diagnostics")]
+        if kind == MESH {
+            crate::producers::select_mesh(self.pipeline as This, arguments, stride, max);
+        }
+        #[cfg(feature = "diagnostics")]
         if matches!(kind, DISPATCH | MESH) && let Some(x) = crate::producers::word()
             && let Some(record) = crate::producers::record_index(arguments, stride, max, x) {
             crate::producers::Journal::consumer(list, p.name.clone(), kind, record,
