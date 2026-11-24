@@ -279,7 +279,7 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
-    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let res = resource::track_shader(&p, &native, &c, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res, target)
@@ -308,7 +308,7 @@ pub fn emit(
     let p = ir::thread_edges(p, &edges)?;
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let res = resource::track_shader(&p, native, c, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res, target)
 }
 

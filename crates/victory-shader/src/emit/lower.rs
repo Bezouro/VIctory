@@ -3647,6 +3647,12 @@ impl<'a> Lower<'a> {
         else {
             unreachable!()
         };
+        // Proven loads from the compute root-argument table already have a
+        // binding for every result. get() materialises constants on demand,
+        // while descriptor accesses use their tracked resource and offset.
+        if inst.writes.first().is_some_and(|w| self.params.contains_key(&w.1)) {
+            return Ok(());
+        }
         let name = inst.name();
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
