@@ -366,6 +366,11 @@ pub(crate) fn unmapped(base: usize) {
     images().retain(|m| m.image.base() != base);
 }
 
+/// Resolve a dynamic import using the same export table as initial IAT binding.
+pub fn mapped_export(base: usize, symbol: &victory_pe::ImportSymbol) -> Option<usize> {
+    images().iter().find(|m| m.image.base() == base)?.image.export_symbol(symbol)
+}
+
 /// `DisableThreadLibraryCalls` for a title image; `None` if `base` is not
 /// one. Fails, as on Windows, for an image with static TLS.
 pub fn disable_thread_calls(base: usize) -> Option<bool> {

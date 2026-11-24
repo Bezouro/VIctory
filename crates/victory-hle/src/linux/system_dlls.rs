@@ -52,9 +52,16 @@ pub(crate) fn name(handle: usize) -> Option<String> {
     table.by_handle.get(&handle).cloned()
 }
 
-/// `GetProcAddress` on a pseudo module: by name, or by ordinal for values
+/// `GetProcAddress` on a mapped title image or a pseudo module: by name, or by ordinal for values
 /// below 0x10000.
 pub(crate) fn proc_address(handle: usize, name: Option<&str>, ordinal: u16) -> Option<usize> {
+    if crate::runtime::image_path(handle).is_some() {
+        let symbol = match name {
+            Some(name) => victory_pe::ImportSymbol::Name { hint: 0, name: name.to_owned() },
+            None => victory_pe::ImportSymbol::Ordinal(ordinal),
+        };
+        return victory_loader::linux::thread::mapped_export(handle, &symbol);
+    }
     let file = self::name(handle)?;
     match name {
         Some(name) => super::lookup(&file, name),
