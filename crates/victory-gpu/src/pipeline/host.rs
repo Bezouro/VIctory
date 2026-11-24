@@ -321,6 +321,8 @@ pub(crate) struct HostPipeline {
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
+    /// A procedural rectangle GS consumes the original three vertex IDs.
+    pub(crate) rect_gs: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
 }
@@ -346,17 +348,17 @@ impl HostPipeline {
             if *DEBUG.get_or_init(|| std::env::var("VICTORY_DEBUG_PS").as_deref() == Ok("1"))
                 && g.is_some_and(|g| g.depth_format != DXGI_FORMAT_UNKNOWN && g.depth.DepthEnable.as_bool() && g.targets.NumRenderTargets != 0)
                 && shaders.iter().any(|s| s.stage == "pixel")
-                && let Some(mut pipeline) = Self::make(shaders, g, true)
+                && let Some(mut pipeline) = Self::make(shaders, g, true, true)
             {
                 pipeline.name.push_str(" [diagnostic slope colour]");
                 tracing::info!(?shaders, "geometry rendered with a diagnostic pixel shader");
                 return Some(pipeline);
             }
         }
-        Self::make(shaders, g, false)
+        Self::make(shaders, g, false, true)
     }
 
-    fn make(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, diagnostic_pixel: bool) -> Option<HostPipeline> {
+    fn make(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, diagnostic_pixel: bool, allow_rect_gs: bool) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -584,6 +586,7 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                rect_gs: false,
             });
         }
         let Some(g) = g else {
@@ -605,12 +608,12 @@ impl HostPipeline {
             let ms = MeshStages::new(code(0));
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms, code(1), (g, g.rasterizer),
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
                     &name,
                 ),
                 None => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms, code(1), (g, g.rasterizer),
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
                     &name,
                 ),
@@ -634,17 +637,48 @@ impl HostPipeline {
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
+                rect_gs: false,
             });
+        }
+
+        #[cfg(target_os = "linux")]
+        let gs = if allow_rect_gs && g.topology.0 == RECTANGLES && g.inputs.is_empty()
+            && let (Some(vs), Some(_)) = (find("vertex"), find("pixel"))
+            && matches!(vs.hash.as_str(),
+                "1d2c970773ce2183" | "25ebc92075b62822" | "72c739b61097456d" | "1d7b30217b395cd8")
+        {
+            let result = victory_shader::emit::procedural_rectangle(
+                &vs.translated()?.host.dxil, &code_bytes(&code(1)));
+            victory_loader::linux::signals::reclaim();
+            match result {
+                Ok(gs) => Some(gs),
+                Err(error) => {
+                    tracing::warn!(?shaders, %error, "procedural rectangle shader refused");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let gs: Option<Arc<[u8]>> = { let _ = allow_rect_gs; None };
+        let gs_code = gs.as_deref().map_or(D3D12_SHADER_BYTECODE::default(), |b| {
+            D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr().cast(), BytecodeLength: b.len() }
+        });
+        let mut raster = g.rasterizer;
+        if gs.is_some() {
+            raster.CullMode = D3D12_CULL_MODE_NONE;
         }
 
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
+            GS: gs_code,
             PS: code(1),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
+            RasterizerState: raster,
             DepthStencilState: g.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
@@ -663,12 +697,12 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        let name = super::library::name(
-            "graphics",
-            &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-            &state,
-        );
+        let vs_bytes = code_bytes(&desc.VS);
+        let ps_bytes = code_bytes(&desc.PS);
+        let name = match gs.as_deref() {
+            Some(bytes) => super::library::name("graphics rectangle", &root_blob, &[&vs_bytes, &ps_bytes, bytes], &state),
+            None => super::library::name("graphics", &root_blob, &[&vs_bytes, &ps_bytes], &state),
+        };
         let made = if let Some(depth) = depth_with_bounds {
             let vertex = VertexStream {
                 vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc.VS),
@@ -682,11 +716,16 @@ impl HostPipeline {
                     desc.PrimitiveTopologyType,
                 ),
             };
-            stream_pipeline(
-                &host.device, &root, vertex, desc.PS, g,
-                Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                &name,
-            )
+            let depth = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth);
+            if gs.is_some() {
+                let stages = ProceduralVertexStream {
+                    vertex,
+                    gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, desc.GS),
+                };
+                stream_pipeline(&host.device, &root, stages, desc.PS, (g, raster), depth, &name)
+            } else {
+                stream_pipeline(&host.device, &root, vertex, desc.PS, (g, raster), depth, &name)
+            }
         } else {
             super::library::pipeline(
                 &name,
@@ -698,13 +737,17 @@ impl HostPipeline {
         };
         let pso = match made {
             Ok(pso) => pso,
+            Err(e) if gs.is_some() => {
+                tracing::warn!(?shaders, error = %e, "host refused procedural rectangle PSO");
+                return Self::make(shaders, Some(g), diagnostic_pixel, false);
+            }
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;
             }
         };
-        tracing::info!(?shaders, "host pipeline");
+        tracing::info!(?shaders, procedural_rectangles = gs.is_some(), "host pipeline");
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -724,6 +767,7 @@ impl HostPipeline {
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),
+            rect_gs: gs.is_some(),
         })
     }
 }
@@ -738,6 +782,12 @@ struct VertexStream {
     input: Sub<D3D12_INPUT_LAYOUT_DESC>,
     strip_cut: Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>,
     topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+}
+
+#[repr(C)]
+struct ProceduralVertexStream {
+    vertex: VertexStream,
+    gs: Sub<D3D12_SHADER_BYTECODE>,
 }
 
 /// The mesh stage of a stream, and its topology.
@@ -784,7 +834,7 @@ fn mesh_pipeline(
         root,
         MeshStages::new(ms),
         ps,
-        g,
+        (g, g.rasterizer),
         Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
         name,
     )
@@ -797,7 +847,7 @@ fn stream_pipeline<S, D>(
     root: &ID3D12RootSignature,
     stages: S,
     ps: D3D12_SHADER_BYTECODE,
-    g: &GraphicsState,
+    (g, rasterizer): (&GraphicsState, D3D12_RASTERIZER_DESC),
     depth: Sub<D>,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
@@ -823,7 +873,7 @@ fn stream_pipeline<S, D>(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
             g.sample_mask,
         ),
-        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, rasterizer),
         depth,
         targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
@@ -915,6 +965,10 @@ fn root_signature(
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "rect_test.rs"]
+mod rect_test;
 
 #[cfg(test)]
 mod tests {

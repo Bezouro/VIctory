@@ -83,6 +83,10 @@
 
 mod bitcode;
 mod container;
+#[cfg(target_os = "linux")]
+mod rect;
+#[cfg(target_os = "linux")]
+pub use rect::procedural_rectangle;
 #[cfg(test)]
 mod diff_tests;
 #[cfg(all(test, windows))]

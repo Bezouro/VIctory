@@ -142,7 +142,9 @@ impl Draws {
                 for &(index, hash, occurrence) in &self.selected {
                     if (first..first + n).contains(&index) {
                         let s = &stats[(index - first) as usize];
-                        tracing::info!(hash, occurrence, clipped_primitives = s.CPrimitives,
+                        tracing::info!(hash, occurrence, input_vertices = s.IAVertices,
+                            geometry_invocations = s.GSInvocations, geometry_primitives = s.GSPrimitives,
+                            clipped_primitives = s.CPrimitives,
                             pixel_invocations = s.PSInvocations, "completed comparison pass");
                     }
                 }

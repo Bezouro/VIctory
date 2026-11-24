@@ -1536,7 +1536,7 @@ pub(crate) fn query_storage(ty: D3D12_QUERY_HEAP_TYPE, count: u32, element_bytes
     Some((heap?, readback_buffer(u64::from(count) * element_bytes)?))
 }
 
-#[cfg(feature = "diagnostics")]
+#[cfg(any(test, feature = "diagnostics"))]
 pub(crate) fn readback_buffer(bytes: u64) -> Option<ID3D12Resource> {
     let device = &host()?.device;
     let mut back: Option<ID3D12Resource> = None;

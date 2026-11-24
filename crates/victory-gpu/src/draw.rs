@@ -1400,11 +1400,14 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        let ready = self.prepare(list, false);
+        let expand = ready && self.topology == RECTANGLES
+            && !crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rect_gs);
+        let ran = ready && (!expand || self.rectangles(list, vertices, first));
         if ran {
-            // Rectangles were expanded into their own vertex buffers.
-            let (count, from) = if rects {
+            // A procedural rectangle keeps its own vertex numbers. Only a
+            // rectangle expanded into a scratch vertex buffer starts at zero.
+            let (count, from) = if expand {
                 (vertices / 3 * 6, 0)
             } else {
                 (vertices, first)
@@ -1584,7 +1587,7 @@ impl State {
             why(self, "pipeline kind does not match indirect command");
             return false;
         }
-        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES {
+        if matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES && !(kind == DRAW && p.rect_gs) {
             why(self, "rectangle topology");
             return false;
         }
