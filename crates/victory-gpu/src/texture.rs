@@ -313,12 +313,12 @@ fn detile_subresource(
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(windows))]
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     crate::host::readable(at, len)
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(windows)]
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;

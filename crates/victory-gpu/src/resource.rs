@@ -2175,13 +2175,15 @@ mod tests {
     }
 
     #[test]
-    fn target_format_is_identity_for_non_packed_formats() {
+    fn target_format_only_changes_known_substitutions() {
         for format in 0..=200u32 {
             if PACKED_16.contains(&format) {
                 assert!(
                     [format, RGBA8_UNORM].contains(&target_format(format)),
                     "unexpected target format for {format}"
                 );
+            } else if format == 67 {
+                assert_eq!(target_format(format), 10);
             } else if (118..=120).contains(&format) {
                 assert_eq!(target_format(format), format - 118 + 45);
             } else {
