@@ -1965,8 +1965,8 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
+/// A submission's refreshes not done yet, merged per buffer wherever the
+/// requested spans overlap: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
@@ -1975,21 +1975,24 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<std::ops::Range<usize>>)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        if len == 0 {
+            return;
+        }
+        let range = address..address + len;
         match self
             .refreshes
             .iter_mut()
             .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((_, spans)) => merge_span(spans, range),
+            None => self.refreshes.push((shadow.clone(), Vec::from([range]))),
         }
     }
 
@@ -2007,14 +2010,34 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        for (shadow, spans) in self.refreshes.drain(..) {
+            for span in spans {
+                let (from, to) = (span.start, span.end);
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Insert into disjoint sorted spans. Two draws touching distant parts of a
+/// large pool do not require the pages between them to be read or watched.
+fn merge_span(spans: &mut Vec<std::ops::Range<usize>>, mut range: std::ops::Range<usize>) {
+    let first = spans.partition_point(|s| s.end < range.start);
+    let count = spans[first..].partition_point(|s| s.start <= range.end);
+    if count == 0 {
+        spans.insert(first, range);
+    } else {
+        range.start = range.start.min(spans[first].start);
+        range.end = range.end.max(spans[first + count - 1].end);
+        spans[first] = range;
+        if count > 1 {
+            spans.drain(first + 1..first + count);
         }
     }
 }
@@ -3339,6 +3362,17 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn refreshes_only_bridge_gaps_when_a_draw_requests_the_gap() {
+        let mut spans = Vec::new();
+        for range in [90..120, 50..60, 5..10, 9..15, 52..59] {
+            super::merge_span(&mut spans, range);
+        }
+        assert_eq!(spans, [5..15, 50..60, 90..120]);
+        super::merge_span(&mut spans, 15..95);
+        assert_eq!(spans.as_slice(), &[5..120]);
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
