@@ -274,8 +274,20 @@ extern "win64" fn present(
         }
     }
     #[cfg(feature = "diagnostics")]
-    if crate::capture::listed(frame) {
-        crate::capture::dump_targets(frame);
+    {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::draw::drawn() + crate::draw::dispatched();
+        crate::capture::note_busy(frame, now.saturating_sub(LAST.swap(now, Ordering::Relaxed)));
+        let shown = crate::capture::shown(frame);
+        if crate::capture::listed(frame) {
+            crate::capture::dump_targets(frame);
+        }
+        if let (Some(copy), Some(host)) = (shown, crate::host::host()) {
+            let state = crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+            if host.present(&copy.texture, state, frame).is_some() {
+                return S_OK;
+            }
+        }
     }
     if planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
