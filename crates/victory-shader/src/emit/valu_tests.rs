@@ -1237,3 +1237,44 @@ fn scalar_bytes_through_a_mixed_use_heap_descriptor() {
         }
     }
 }
+
+/// Each incoming address starts at a different PC. Both branch choices
+/// load through the same joined pointer into the program's embedded table.
+#[test]
+fn code_table_phi_reads_the_word_chosen_by_the_taken_branch() {
+    let mut words = vec![s_mov_b32(5, 128)];
+    words.extend(s_load_dwordx4(8, 4));
+    words.extend([
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0005, // s_cbranch_scc1 -> second PC
+        0xBE8C_1F00, // s_getpc_b64 s[12:13]
+        0x800C_FF0C,
+        0,           // s_add_u32 s12, s12, first table offset
+        0x820D_800D, // s_addc_u32 s13, s13, 0
+        0xBF82_0004, // s_branch -> load
+        0xBE8C_1F00,
+        0x800C_FF0C,
+        0,
+        0x820D_800D,
+        0xF400_0386,
+        0xFA00_0000, // s_load_dword s14, s[12:13], 0
+        vop1(1, 0, sgpr(14)),
+    ]);
+    words.extend(buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    let table = words.len() as u32;
+    words.extend([0x0000_a11a, 0x0000_b22b]);
+    words[7] = (table - 6) * 4;
+    words[12] = (table + 1 - 11) * 4;
+    let shader = lower_cs(&words, false);
+    run_cases(&shader, &[[0; 4], [1; 4]], |backend, i, _, got| {
+        eprintln!("joined shader table: backend={backend} branch={i} read={got:#x}");
+        assert_eq!(got, [0xb22b, 0xa11a][i])
+    });
+    // A guest address in one arm must never acquire shader-relative meaning.
+    words[10] = 0xBE8C_0400; // s_mov_b64 s[12:13], s[0:1]
+    let other = valu_program(&words, false);
+    let ir = ir::build(&other.code, other.wave64, other.vgprs).unwrap();
+    let flow = structure::structure(&ir).unwrap();
+    assert!(resource::track(&ir, &other.layout, other.stage, Some(&flow)).is_err());
+}

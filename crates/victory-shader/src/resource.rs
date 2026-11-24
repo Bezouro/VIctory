@@ -111,6 +111,8 @@ pub struct Descriptor {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
+    /// Shader-relative PCs used by proven joins of embedded-table addresses.
+    pub joined_code_pcs: std::collections::BTreeSet<usize>,
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
@@ -283,6 +285,7 @@ fn track_layout(
     }
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
+    out.joined_code_pcs = t.joined_code_pcs.take();
     if t.lanes.is_none() {
         return Ok(out);
     }
@@ -317,6 +320,7 @@ struct Sum {
 }
 
 struct Tracer<'a> {
+    joined_code_pcs: std::cell::RefCell<std::collections::BTreeSet<usize>>,
     p: &'a Program,
     layout: &'a [RootParam],
     stage: HwStage,
@@ -384,6 +388,7 @@ impl<'a> Tracer<'a> {
             rpo[b] = n;
         }
         let mut t = Tracer {
+            joined_code_pcs: Default::default(),
             p,
             layout,
             stage,
@@ -717,12 +722,65 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// A conditional address into embedded shader data. Each incoming low
+    /// and high pair must refer to the same PC on that CFG edge. The joined
+    /// low already includes that particular getpc instruction's byte offset.
+    fn joined_code_address(&self, low: Value, high: Term) -> bool {
+        let Some((block, i)) = self.phis[low.0 as usize] else {
+            return false;
+        };
+        let lo = &self.p.blocks[block].phis[i];
+        let hi = if let Term::Value(v) = high
+            && let Some((other, j)) = self.phis[v.0 as usize]
+        {
+            if other != block {
+                return false;
+            }
+            Some(&self.p.blocks[other].phis[j])
+        } else {
+            None
+        };
+        let mut proven = Vec::new();
+        for (edge, word) in lo.args.iter().enumerate() {
+            let source = self.vorigin(*word);
+            let upper = hi.map_or(high, |phi| self.vorigin(phi.args[edge]));
+            if source == Term::Value(low) && upper == high {
+                continue;
+            }
+            let Some(pc) = self.sum(source).base.and_then(|v| self.getpc(v)) else {
+                return false;
+            };
+            let Some((_, pc_hi)) = pc.writes.get(1) else {
+                return false;
+            };
+            if !self.high_half(upper, Some(*pc_hi)) && !self.carried(upper, *pc_hi) {
+                return false;
+            }
+            proven.push(pc.machine.offset);
+        }
+        if proven.is_empty() {
+            return false;
+        }
+        self.joined_code_pcs.borrow_mut().extend(proven);
+        true
+    }
+
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
+        }
+        if s.base.is_none()
+            && let Some(joined) = s.dynamic
+            && self.joined_code_address(joined, hi)
+        {
+            return Ok(Address {
+                param: CODE,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic: Some(joined),
+            });
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
         if let Some(pc) = self.getpc(base) {
@@ -1868,6 +1926,41 @@ pub(crate) mod tests {
             offset,
             dynamic: None,
         }
+    }
+
+    #[test]
+    fn two_paths_into_one_code_table_load() {
+        let r = track_words(
+            &[
+                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+                0x8002_FF02,
+                0x0000_0040, // s_add_u32 s2, s2, 0x40
+                0x8203_8003, // s_addc_u32 s3, s3, 0
+                0xBF06_8001, // 0x10: s_cmp_eq_u32 s1, 0
+                0xBF85_0005, // 0x14: s_cbranch_scc1 -> 0x2c
+                0xD70F_0457,
+                0x0000_054A, // 0x18: v_add_co_u32 v87, s4, v74, s2
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0xBF82_0004, // 0x28: s_branch -> 0x3c
+                0xD70F_0457,
+                0x0000_054B, // 0x2c: v_add_co_u32 v87, s4, v75, s2
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0xDC34_8000,
+                0x577D_0057, // 0x3c: global_load_dwordx2 v[87:88], v[87:88], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset), (CODE, 0));
+        assert!(
+            a.dynamic.is_some(),
+            "the join is the computed term, the byte in the code"
+        );
     }
 
     #[test]

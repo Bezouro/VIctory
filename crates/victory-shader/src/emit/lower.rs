@@ -3200,6 +3200,19 @@ impl<'a> Lower<'a> {
             // vertex fetch call, whose results arrive as inputs.
             return Err("a register the emitter does not model");
         }
+        if name == "s_getpc_b64" && self.x.res.joined_code_pcs.contains(&inst.machine.offset) {
+            // Embedded constant data starts at shader-relative address zero.
+            // Preserve the PC from the actual path when scalar/vector code
+            // computes an address before a conditional join.
+            let low = self.s.m.i32(inst.machine.offset as u32 + 4);
+            let high = self.s.m.i32(0);
+            self.set(lo, Val::I32(low));
+            self.set(
+                dst_code.and_then(|code| inst.write(Reg::S(code + 1))),
+                Val::I32(high),
+            );
+            return Ok(());
+        }
         let c = self.cur;
         let src32 = |l: &mut Self, k: usize| -> Result<V, Why> {
             // SOPK arithmetic reads its destination as the first source.
