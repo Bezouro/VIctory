@@ -5,6 +5,7 @@ extends SceneTree
 var model_count := 0
 var scene_bounds: Array[Vector3] = []
 var view_height := 1.0
+const Terrain := preload("terrain.gd")
 const GENERATE_TANGENTS := 8  # GLTFDocument import flag for normal-mapped surfaces.
 var camera := Camera3D.new()
 var focus := Vector3.ZERO
@@ -116,7 +117,10 @@ func load_model(path: String) -> Node3D:
 			var state := GLTFState.new()
 			if loader.append_from_file(path, state, GENERATE_TANGENTS) != OK:
 				return null
-			return loader.generate_scene(state) as Node3D
+			var model := loader.generate_scene(state) as Node3D
+			if model != null:
+				Terrain.apply(model, state, path)
+			return model
 		"obj":
 			var mesh := read_obj(path)
 			if mesh == null:
