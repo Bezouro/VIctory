@@ -39,6 +39,12 @@ pub struct StrideEntry {
 impl StrideEntry {
     /// Bytes per entry in the table: slot `i`'s entry is at `i * BYTES`.
     pub const BYTES: u32 = 8;
+    /// A writable buffer, combined with its positive byte stride.
+    pub const UAV: u32 = 1 << 31;
+    /// A constant buffer, with no element stride.
+    pub const CBV: u32 = 1 << 30;
+    /// The byte stride without the handle-class flags.
+    pub const STRIDE_MASK: u32 = Self::CBV - 1;
     /// The raw slots an entry can name.
     pub const RAW_SLOTS: u32 = (1 << 28) - 1;
 

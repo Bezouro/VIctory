@@ -94,6 +94,10 @@ fn build_cs(body: &[u32], root_srv: bool) -> HostShader {
 /// layout: 4 root constants in `s0..s3`, the address of a table holding a
 /// UAV in `s4`.
 fn lower_cs(words: &[u32], root_srv: bool) -> HostShader {
+    lower_program(valu_program(words, root_srv))
+}
+
+fn valu_program(words: &[u32], root_srv: bool) -> NativeProgram {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let mut native = NativeProgram {
         stage: HwStage::Cs,
@@ -158,6 +162,10 @@ fn lower_cs(words: &[u32], root_srv: bool) -> HostShader {
         });
     }
 
+    native
+}
+
+fn lower_program(native: NativeProgram) -> HostShader {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res =
@@ -1028,4 +1036,115 @@ fn canonical_compute_cfg_preserves_conditional_uav_writes() {
     run_cases(&shader, &[[0, 71, 0, 0], [29, 99, 0, 0]], |_, _, args, result| {
         assert_eq!(result, if args[0] == 0 { args[1] } else { args[0] });
     });
+}
+
+/// One bindless descriptor is read as a vector or a scalar, selected by
+/// root constant s1. The scalar instruction reads bytes 4 and 8, even
+/// when its SRV needs a raw alias at a different offset.
+#[test]
+fn scalar_bytes_through_a_mixed_use_heap_descriptor() {
+    use super::{StrideEntry, host::Stride};
+    let mut words = vec![s_mov_b32(5, 0x80), s_mov_b32(7, 0x80)];
+    words.extend(s_load_dwordx4(8, 4)); // s[8:11] = output UAV
+    words.push(sop2(0x1e, 18, 0, 0x85)); // s18 = slot * 32
+    words.extend([s_load_dwordx4(12, 6)[0], 18 << 25]); // resource heap + s18
+    words.extend([
+        0xbf06_8001, // s_cmp_eq_u32 s1, 0
+        0xbf85_0003, // s_cbranch_scc1 scalar
+        0xe030_0004,
+        0x8003_0000, // buffer_load_dword v0, off, s[12:15], 0 offset:4
+        0xbf82_0003, // s_branch store
+        0xf424_0406,
+        0xfa00_0004, // scalar: s_buffer_load_dwordx2 s[16:17], s[12:15], 4
+        vop1(1, 0, sgpr(17)),
+    ]);
+    words.extend(buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    let mut native = valu_program(&words, false);
+    native.layout.push(RootParam {
+        root: RootType::ResourceHeap,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 6,
+        slot: 0,
+    });
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 7 << 1,
+        threads: [1, 1, 1],
+    });
+    let shader = lower_program(native);
+    assert!(shader.stride_table);
+
+    let _lock = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for host in [false, true]
+        .into_iter()
+        .filter_map(|warp| Host::new(warp).ok())
+    {
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        let values = [11, 23, 37, 41, 53, 67, 79, 89];
+        let views = [
+            View::RawUav(1),
+            View::Buffer {
+                data: &values,
+                stride: Stride::Raw,
+            },
+            View::Cbv(&values),
+            View::Buffer {
+                data: &values,
+                stride: Stride::Structured(16),
+            },
+            View::RawAlias {
+                of: 3,
+                first: 0,
+                dwords: 8,
+            },
+        ];
+        let entries = [
+            [4 | StrideEntry::UAV, 0],
+            [4, 0],
+            [StrideEntry::CBV, 0],
+            StrideEntry {
+                stride: 16,
+                raw_slot: Some(4),
+                bias: 4,
+            }
+            .words(),
+            [4, 0],
+            [0, 0],
+        ];
+        // Scalar raw, CBV, alias with bias, out-of-range guard; vector raw.
+        for (slot, vector, want) in [(1, 0, 37), (2, 0, 37), (3, 0, 41), (25, 0, 0), (1, 1, 23)] {
+            let mut data = vec![0; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                data[u.index as usize] = match u.root {
+                    RootType::Table => 0,
+                    RootType::Constants => [slot, vector, 0, 0][u.dword as usize],
+                    root => super::host::guard(root, views.len(), 0).unwrap(),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(data)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: entries.iter().flatten().copied().collect(),
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out[0], [want], "slot {slot}, vector {vector}");
+        }
+    }
 }

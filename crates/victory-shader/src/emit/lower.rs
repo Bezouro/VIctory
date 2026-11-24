@@ -247,8 +247,8 @@ struct Lower<'a> {
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
     /// Runtime stride table entries read in a block, by the descriptor's
-    /// load: the raw slot, the stride and the bias.
-    entries: HashMap<(usize, Site, u8), [V; 3]>,
+    /// load: raw slot, stride, bias and the stride with its class flags.
+    entries: HashMap<(usize, Site, u8), [V; 4]>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -3712,6 +3712,24 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A scalar load and a vector byte-buffer load through the same
+        // bindless descriptor can read an SRV. The heap entry, unlike a
+        // static resource-table declaration, knows its actual handle class.
+        if let Source::Loaded { load, .. } = src
+            && self
+                .scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap)
+            && self.x.res.descriptors.iter().any(|d| {
+                &d.source == src
+                    && self.x.p.blocks[d.site.0].insts[d.site.1]
+                        .name()
+                        .starts_with("buffer_load_dword")
+            })
+        {
+            return self.scalar_heap_buffer(inst, site, src, addr, code, count);
+        }
         let h = self.handle(site, src, false, (13, 0x1_0000))?;
         let constant = match addr {
             V::Const(_)
@@ -3751,6 +3769,70 @@ impl<'a> Lower<'a> {
                 }
             };
             self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// Reads uniform descriptor bytes using the class of the bound view.
+    /// Only the selected D3D12 handle may be dereferenced. Unknown, null
+    /// and non-buffer slots return zero.
+    fn scalar_heap_buffer(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        src: &Source,
+        addr: V,
+        dest: u8,
+        count: u32,
+    ) -> Result<(), Why> {
+        let [raw, stride, bias, tagged] = self.stride_entry(src)?;
+        let zero = self.s.m.i32(0);
+        let as_cbv = self.s.m.i32(super::StrideEntry::CBV);
+        let is_cbv = self.s.m.cmp(self.cur, pred::EQ, tagged, as_cbv);
+        let is_raw = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+        let is_uav = self.s.m.cmp(self.cur, pred::SLT, tagged, zero);
+        let cbv = self.s.m.new_block();
+        let buffer = self.s.m.new_block();
+        let raw_class = self.s.m.new_block();
+        let srv = self.s.m.new_block();
+        let uav = self.s.m.new_block();
+        let join = self.s.m.new_block();
+        self.s
+            .m
+            .terminate(self.cur, Term::CondBr(is_cbv, cbv, buffer));
+        self.s
+            .m
+            .terminate(buffer, Term::CondBr(is_raw, raw_class, join));
+        self.s
+            .m
+            .terminate(raw_class, Term::CondBr(is_uav, uav, srv));
+
+        self.cur = cbv;
+        let h = self.handle(site, src, false, (13, 0x1_0000))?;
+        let mut incoming = Vec::new();
+        for k in 0..count {
+            let off = self.s.m.i32(4 * k);
+            let byte = self.s.m.bin(cbv, Bin::Add, addr, off);
+            incoming.push(vec![(zero, buffer), (self.cbuffer_dword(h, byte), cbv)]);
+        }
+        self.s.m.terminate(cbv, Term::Br(join));
+        for (block, props) in [(srv, 11), (uav, 0x100b)] {
+            self.cur = block;
+            let h = self.s.heap_handle(block, raw, false, false, (props, 0));
+            let start = self.s.m.bin(block, Bin::Add, addr, bias);
+            for (k, values) in incoming.iter_mut().enumerate() {
+                let off = self.s.m.i32(4 * k as u32);
+                let byte = self.s.m.bin(block, Bin::Add, start, off);
+                let value = self.raw_load(h, byte, 1)[0];
+                values.push((self.as_int(value), block));
+            }
+            self.s.m.terminate(block, Term::Br(join));
+        }
+        self.cur = join;
+        for (k, values) in incoming.into_iter().enumerate() {
+            let phi = self.s.m.phi(join, self.s.t.i32);
+            self.s.m.set_phi(phi, values);
+            self.write(inst, Reg::S(dest + k as u8), phi, None);
         }
         Ok(())
     }
@@ -4501,9 +4583,9 @@ impl<'a> Lower<'a> {
     /// The entry of the host's runtime stride table (`t0`,
     /// [`super::STRIDE_SPACE`]) for the view-heap slot of `src`, read in the
     /// current block: the slot holding a raw view of the buffer's bytes
-    /// (the slot itself when the table names none), the stride and the bias
-    /// ([`super::StrideEntry`]).
-    fn stride_entry(&mut self, src: &Source) -> Result<[V; 3], Why> {
+    /// (the slot itself when the table names none), the stride, the bias
+    /// and the stride word with its handle-class flags ([`super::StrideEntry`]).
+    fn stride_entry(&mut self, src: &Source) -> Result<[V; 4], Why> {
         let key = match src {
             Source::Loaded { load, first } => Some((self.cur, *load, *first)),
             _ => None,
@@ -4543,7 +4625,9 @@ impl<'a> Lower<'a> {
         let raw = self.s.m.select(c, own, slot, named);
         let k = self.s.m.i32(28);
         let bias = self.s.m.bin(c, Bin::LShr, word, k);
-        let e = [raw, stride, bias];
+        let bits = self.s.m.i32(super::StrideEntry::STRIDE_MASK);
+        let bytes = self.s.m.bin(c, Bin::And, stride, bits);
+        let e = [raw, bytes, bias, stride];
         if let Some(k) = key {
             self.entries.insert(k, e);
         }
@@ -4568,7 +4652,7 @@ impl<'a> Lower<'a> {
         off: V,
         props: u32,
     ) -> Result<(V, V), Why> {
-        let [raw, stride, bias] = self.stride_entry(src)?;
+        let [raw, stride, bias, _] = self.stride_entry(src)?;
         let c = self.cur;
         let element = self.s.m.bin(c, Bin::Mul, index, stride);
         let byte = self.s.m.bin(c, Bin::Add, element, off);

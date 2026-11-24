@@ -484,16 +484,17 @@ impl HostHeap {
         }
     }
 
-    fn set_entry(&self, index: u32, entry: StrideEntry) {
+    fn set_entry(&self, index: u32, entry: StrideEntry, class: u32) {
         if let Some(t) = &self.strides
             && index < t.len
         {
+            let [stride, raw] = entry.words();
             // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of
             // `t.len` entries of two dwords.
             unsafe {
                 (t.ptr as *mut [u32; 2])
                     .add(index as usize)
-                    .write(entry.words());
+                    .write([stride | class, raw]);
             }
         }
     }
@@ -841,7 +842,12 @@ impl HostHeap {
                 }
             }
         };
-        self.set_entry(index, entry);
+        let class = match view {
+            View::Constant(..) => StrideEntry::CBV,
+            _ if stride != 0 && view_is_unordered(view) => StrideEntry::UAV,
+            _ => 0,
+        };
+        self.set_entry(index, entry, class);
     }
 
     /// Slot `index`'s runtime stride table entry, as shaders read it.
@@ -866,7 +872,7 @@ impl HostHeap {
             return;
         }
         self.unalias(index);
-        self.set_entry(index, StrideEntry::default());
+        self.set_entry(index, StrideEntry::default(), 0);
     }
 
     /// The slot of the null raw view standing in for a raw view the host

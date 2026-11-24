@@ -318,7 +318,7 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
         .words()
     };
     assert_eq!(heap.entry_words(0), entry(4, None, 0));
-    assert_eq!(heap.entry_words(1), entry(4, Some(pool), 4));
+    assert_eq!(heap.entry_words(1), entry(4 | StrideEntry::UAV, Some(pool), 4));
     assert_eq!(heap.entry_words(2), entry(12, Some(pool + 1), 4));
     assert_eq!(heap.entry_words(3), entry(16, Some(pool + 2), 0));
 
@@ -368,6 +368,10 @@ fn unknown_stride_reads_reach_the_bytes_of_the_view_in_the_slot() {
     assert_eq!(heap.entry_words(first), [0, 0]);
     heap.make_at(6, &placed(false, data, structured(12), (0, 4)));
     assert_eq!(heap.entry_words(6), entry(12, Some(pool + 3), 0));
+    heap.make_at(7, &View::Constant(data, 256));
+    assert_eq!(heap.entry_words(7), [StrideEntry::CBV, 0]);
+    heap.make_null(7);
+    assert_eq!(heap.entry_words(7), [0, 0]);
     drop(memory);
 }
 
