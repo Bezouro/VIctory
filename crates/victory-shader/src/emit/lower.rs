@@ -9034,6 +9034,7 @@ impl<'a> Lower<'a> {
                 taken,
                 not_taken,
             } => {
+                let wave_exit = self.pixel_vcc_exit(b, when, taken, not_taken);
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
@@ -9048,6 +9049,12 @@ impl<'a> Lower<'a> {
                             .map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
+                };
+                let cond = if let Some(exit) = wave_exit {
+                    // Use the exit direction after any condition inversion.
+                    self.wave_loop_condition(cond, exit == taken)
+                } else {
+                    cond
                 };
                 self.branch_term(b, cond, taken, not_taken)
             }
@@ -9065,6 +9072,85 @@ impl<'a> Lower<'a> {
         let _ = Exit::End;
         self.s.m.terminate(self.cur, term);
         Ok(())
+    }
+
+    /// The edge that leaves a wave32 pixel loop on a nonzero VCC produced
+    /// by a compare in this block.
+    fn pixel_vcc_exit(
+        &self,
+        b: usize,
+        when: Bool,
+        taken: usize,
+        not_taken: usize,
+    ) -> Option<usize> {
+        if !self.s.pixel
+            || self.x.native.wave64
+            || self.x.target.lanes_min != 32
+            || self.x.target.lanes_max != 32
+        {
+            return None;
+        }
+        let block = &self.x.p.blocks[b];
+        if block.exit != (Exit::Branch { taken, not_taken }) {
+            return None;
+        }
+        let (branch, body) = block.insts.split_last()?;
+        let (back, exit) = match branch.name() {
+            "s_cbranch_vccz" => (taken, not_taken),
+            "s_cbranch_vccnz" => (not_taken, taken),
+            _ => return None,
+        };
+        let mask = branch.read(Reg::S(crate::ir::VCC))?;
+        if !self.x.st.bools.support(when).contains(&Atom::Lane(mask))
+            || !body.iter().any(|inst| {
+                inst.name().starts_with("v_cmp") && inst.write(Reg::S(crate::ir::VCC)) == Some(mask)
+            })
+        {
+            return None;
+        }
+        let returns_to_loop = |mut to| {
+            for _ in 0..self.rpo.len() {
+                if self.counters.contains_key(&to) && self.rpo[to] <= self.rpo[b] {
+                    return true;
+                }
+                match self.x.st.exits[to] {
+                    LaneExit::Jump(next)
+                        if self.rpo[next] > self.rpo[to] || self.counters.contains_key(&next) =>
+                    {
+                        to = next
+                    }
+                    _ => break,
+                }
+            }
+            false
+        };
+        (returns_to_loop(back) && !returns_to_loop(exit)).then_some(exit)
+    }
+
+    fn wave_loop_condition(&mut self, cond: V, taken_exits: bool) -> V {
+        let at = self.cur;
+        let yes = self.s.m.bool(true);
+        let no = self.s.m.bool(false);
+        let exits = if taken_exits {
+            cond
+        } else {
+            self.s.m.select(at, cond, no, yes)
+        };
+        self.s.flags |= flags::WAVE_OPS;
+        let any = self.s.op(
+            at,
+            "waveAnyTrue",
+            Attr::NoUnwind,
+            self.s.t.i1,
+            113,
+            &[exits],
+        );
+        // A helper invocation excluded from the vote can still leave on its own bit.
+        if taken_exits {
+            self.s.m.bin(at, Bin::Or, exits, any)
+        } else {
+            self.s.m.select(at, any, no, cond)
+        }
     }
 
     /// The terminator of block `b` branching to `taken` where `cond` holds.

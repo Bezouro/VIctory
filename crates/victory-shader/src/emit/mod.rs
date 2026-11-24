@@ -1924,6 +1924,16 @@ mod barycentric_tests {
         more: &[SigElement],
         fp16: bool,
     ) -> Result<HostShader, ShaderError> {
+        pixel_for_target(words, input_addr, more, fp16, Target::ANY)
+    }
+
+    fn pixel_for_target(
+        words: &[u32],
+        input_addr: u32,
+        more: &[SigElement],
+        fp16: bool,
+        target: Target,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1947,12 +1957,12 @@ mod barycentric_tests {
             },
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let mut target = element("SV_Target", 16, 0);
-        target.usage = 15;
+        let mut color = element("SV_Target", 16, 0);
+        color.usage = 15;
         let mut rows = vec![element("TEXCOORD", 0, 0)];
         rows.extend_from_slice(more);
         let isg1 = container::signature(&rows, true);
-        let osg1 = container::signature(&[target], false);
+        let osg1 = container::signature(&[color], false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
         let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
@@ -1960,7 +1970,95 @@ mod barycentric_tests {
         let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
         let io = io::raise(&p, &native)?;
         let st = st?;
-        emit(&c, &native, &p, &st, &io, &res, Target::ANY)
+        emit(&c, &native, &p, &st, &io, &res, target)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Vulkan device and DXC"]
+    fn wave32_pixel_loop_exits_when_either_pixel_matches() {
+        let base = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0x7E04_0F02, // v_cvt_u32_f32 v2, v2
+            0xBE80_0380, // s_mov_b32 s0, 0
+            0x8000_8100, // s_add_u32 s0, s0, 1
+            0x7D84_0400, // v_cmp_eq_u32 vcc_lo, s0, v2
+        ];
+        let branches: &[&[u32]] = &[
+            &[0xBF86_FFFD],              // s_cbranch_vccz to the increment
+            &[0xBF87_0001, 0xBF82_FFFC], // s_cbranch_vccnz to the export, otherwise jump back
+        ];
+        let vs_code = crate::hostlib::compile_hlsl(
+            "struct Out { float4 attr : TEXCOORD0; float4 p : SV_Position; };\n\
+             Out main(float2 p : POSITION, float a : VALUE) {\n\
+                 Out v; v.attr = a.xxxx; v.p = float4(p, 0.5, 1); return v;\n\
+             }",
+            "main",
+            "vs_6_0",
+        )
+        .unwrap();
+        let gpu = host::Host::new(false).expect("a Vulkan device is required");
+        let reference = crate::hostlib::compile_hlsl(
+            r#"float4 main(float4 attr : TEXCOORD0) : SV_Target {
+                uint stop = (uint)attr.x;
+                uint i = 0;
+                [loop] while (++i < 64) { if (WaveActiveAnyTrue(i == stop)) break; }
+                return float4(i, i, i, i);
+            }"#,
+            "main",
+            "ps_6_6",
+        )
+        .unwrap();
+        let render = |ps: &HostShader| {
+            let mut vs = host::stub_vs(ps).unwrap();
+            vs.dxil = vs_code.clone();
+            let (root, pso) = gpu.pipeline(&vs, ps).unwrap();
+            gpu.draw(
+                &root,
+                &pso,
+                &host::Draw {
+                    roots: vec![],
+                    textures: &[],
+                    samplers: &[],
+                    vertices: &[-1.0, 1.0, 1.0, 3.0, 1.0, 65.0, -1.0, -3.0, 1.0],
+                    stride: 12,
+                    size: (32, 8),
+                    mesh_groups: 0,
+                },
+            )
+            .unwrap()
+        };
+        let wave32 = Target {
+            lanes_min: 32,
+            lanes_max: 32,
+        };
+        for branch in branches {
+            let mut words = base.to_vec();
+            words.extend_from_slice(branch);
+            words.push(0x7E06_0C00); // v_cvt_f32_u32 v3, s0
+            words.extend(exp_mrt0(3));
+            words.push(0xBF81_0000); // s_endpgm
+            for target in [Target::ANY, wave32] {
+                let ps = pixel_for_target(&words, PERSP_CENTER, &[], false, target).unwrap();
+                assert_eq!(parts(&ps).0 & 0x4000 != 0, target == wave32, "{branch:x?}");
+                let texels = render(&ps);
+                let expected = if target == wave32 {
+                    let mut direct = ps.clone();
+                    direct.dxil = reference.clone();
+                    render(&direct)
+                } else {
+                    (0..32*8).map(|i| [(i % 32 + 1) as f32; 4]).collect()
+                };
+                assert_eq!(
+                    texels,
+                    expected,
+                    "{branch:x?} {target:?}"
+                );
+                let shared = texels.iter().enumerate().filter(|&(i, value)| value[0] < (i % 32 + 1) as f32).count();
+                eprintln!("branch={branch:x?} target={target:?} pixels_exiting_with_another_lane={shared}");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
