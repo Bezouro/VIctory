@@ -225,7 +225,7 @@ impl Shadow {
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
-            let mut synced = Vec::new();
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             let mut runs: Vec<(usize, usize)> = Vec::new();
             let mut at = from;
             while at < to {
@@ -235,7 +235,15 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &mut before[at - from..at - from + n];
                 let title = &mut title[..n];
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
+                if host != old {
+                    // Title threads can write other bytes after this read,
+                    // including through an alias. Refresh the page on the
+                    // next draw even when every GPU byte was written back.
+                    copied[(start + at) / PAGE - start / PAGE] = 0;
+                    if !crate::host::read_into((start + at) as *const u8, title) {
+                        at += n;
+                        continue;
+                    }
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn, and so does the
                     // snapshot: to a later range that overlaps this one,
@@ -258,35 +266,10 @@ impl Shadow {
                     }
                     if let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) {
                         crate::watch::writing(start + at + first, last - first);
-                        let count = crate::host::write_changed(start + at, title, &runs);
-                        written += count;
-                        if count < runs.iter().map(|(a, b)| b - a).sum() {
-                            // A title page disappeared or lost write access. Its
-                            // current contents must be read before the next use.
-                            let page = (start + at) / PAGE - start / PAGE;
-                            self.copied.lock().unwrap_or_else(|e| e.into_inner())[page] = 0;
-                            at += n;
-                            continue;
-                        }
+                        written += crate::host::write_changed(start + at, title, &runs);
                     }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
-            }
-            // Pages made equal to title memory are current in the copy, so
-            // our own write is not taken for the title's; others keep what
-            // they had (a title write there shows at the next refresh).
-            let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
-            if first < last
-                && !synced.is_empty()
-                && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
-                && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
-            {
-                let base = start / PAGE;
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
-                    copied[page - base] = now;
-                }
             }
         }
         // Every submitted step that declared the range is done with it (one
@@ -666,5 +649,29 @@ mod tests {
             "the shader's bytes"
         );
         assert_eq!(peek(base + 4000), 7, "the title's write in between");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn next_draw_sees_a_watched_title_write_during_copy_back() {
+        use victory_loader::linux::vm;
+        let Some(host) = host() else { return };
+        let (buffer, data) = host.shared_buffer(PAGE as u64).unwrap();
+        let base = vm::alloc(0, PAGE, vm::MEM_RESERVE | vm::MEM_COMMIT, vm::PAGE_READWRITE, PAGE).unwrap();
+        let shadow = Shadow::new(buffer, data, 0, base as u64, PAGE as u64);
+        assert_eq!(shadow.update(base, PAGE), PAGE);
+        assert_eq!(shadow.update(base, PAGE), 0, "the guest page is guarded");
+        shadow.writing(base, PAGE);
+        poke(data as usize + 8, 9);
+        AFTER_READ.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+            crate::watch::writing(base + 4000, 1);
+            poke(base + 4000, 7);
+        })));
+        shadow.copy_back(base, PAGE);
+        AFTER_READ.with(|hook| *hook.borrow_mut() = None);
+        shadow.update(base, PAGE);
+        let seen = peek(data as usize + 4000);
+        vm::free(base, 0, vm::MEM_RELEASE).unwrap();
+        assert_eq!(seen, 7, "the next draw reads the concurrent title update");
     }
 }
