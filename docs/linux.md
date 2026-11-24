@@ -202,6 +202,13 @@ kernel read-ahead on its guest mappings. Compare storage reads and frame
 times on the same scene to evaluate its effect on the host.
 
 
+To inspect the first busy world frame while displaying the title's presentation
+planes, set `VICTORY_CAPTURE` to a directory, `VICTORY_CAPTURE_BUSY=2000,1`
+and `VICTORY_DUMP_TARGETS=1280x720`. This saves the presented image and the
+matching internal textures on the frame following the first qualifying workload.
+Use `VICTORY_DUMP_TARGETS=1` for all sizes. Leave `VICTORY_SCENE_EXTENT` and
+`VICTORY_SHOW_TARGET` unset for this comparison.
+
 In a diagnostics build, `VICTORY_SCENE_EXTENT=1280x720` presents the last
 single-sample RGBA8 or BGRA8 target of that size as the scene and composites
 the remaining presentation planes over it. For a title rendering internally

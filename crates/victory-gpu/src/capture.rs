@@ -556,6 +556,17 @@ fn dump_on() -> bool {
     *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
 }
 
+/// An optional extent in VICTORY_DUMP_TARGETS selects only attachments
+/// at that resolution. Other values keep the full frame inventory.
+fn matches_dump_extent(desc: &D3D12_RESOURCE_DESC) -> bool {
+    static EXTENT: std::sync::OnceLock<Option<(u64, u32)>> = std::sync::OnceLock::new();
+    EXTENT.get_or_init(|| {
+        let value = std::env::var("VICTORY_DUMP_TARGETS").ok()?;
+        let (width, height) = value.split_once('x')?;
+        Some((width.parse().ok()?, height.parse().ok()?))
+    }).is_none_or(|extent| extent == (desc.Width, desc.Height))
+}
+
 /// `VICTORY_SHOW_TARGET=<n>`: every frame shows the `n`th texture it
 /// rendered to or wrote (first-use order, the `<i>` of a target dump's file
 /// names) instead of what the title presents; frames with fewer targets show
@@ -695,7 +706,11 @@ pub(crate) fn note_target(resource: crate::object::This) {
     if !targets.iter().any(|&(r, _)| r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
-        targets.push((resource as usize, copy));
+        // Show mode keeps the complete first-use ordering for its indices.
+        // SAFETY: the host copy owns a live texture.
+        if show_index().is_some() || matches_dump_extent(&unsafe { copy.texture.GetDesc() }) {
+            targets.push((resource as usize, copy));
+        }
     }
 }
 
@@ -708,7 +723,7 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !matches_dump_extent(&d) {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
