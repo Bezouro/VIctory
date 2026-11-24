@@ -149,7 +149,12 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    let allowed = ALLOWED_NAMES.contains(&name)
+    // Source-only scripts for two optional frame inspection tools. They receive
+    // the same content, size and embedded-data checks as Rust sources.
+    let frame_tool = matches!(path,
+        "scripts/replay-frame.py" | "tools/scene-preview/scene.gd" | "tools/scene-preview/project.godot"
+    );
+    let allowed = frame_tool || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
