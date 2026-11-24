@@ -190,3 +190,9 @@ go under `$XDG_CACHE_HOME/victory/cache` and saves under
 as their respective base directories. Override these locations with
 `VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR`. GPU and display access use the
 current desktop session.
+
+On a machine without swap, set `VICTORY_PHYSICAL_POOL_DIR` to an existing
+directory inside the writable cache on a disk filesystem with `O_TMPFILE`
+and hole-punch support. The guest physical page pool uses an unnamed sparse
+file there. Its views share bytes as usual, and the kernel can write pages
+back under memory pressure. The file is released when the process exits.

@@ -47,6 +47,7 @@
 //! Thread-safe: one leaf lock, never held across a read of `/proc`.
 
 use std::collections::BTreeMap;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -146,7 +147,30 @@ impl Section {
         Ok(Arc::new(section))
     }
 
-    /// The `memfd`, for a layer that needs the same pages elsewhere.
+    /// Physical pages normally live in shmem. A disk-backed unnamed file lets
+    /// Linux reclaim dirty pages on systems without swap, keeping every alias
+    /// mapped to the same offsets. Closing the last mapping releases the file.
+    fn physical_pool() -> Result<Arc<Section>, u32> {
+        let Some(dir) = std::env::var_os("VICTORY_PHYSICAL_POOL_DIR") else {
+            return Self::new(0);
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_TMPFILE)
+            .mode(0o600)
+            .open(&dir)
+            .map_err(|e| {
+                tracing::error!(?dir, error = %e, "could not open a temporary physical page pool");
+                ERROR_NOT_ENOUGH_MEMORY
+            })?;
+        Ok(Arc::new(Section {
+            fd: file.into(),
+            size: AtomicU64::new(0),
+        }))
+    }
+
+    /// The shared file descriptor, for a layer that needs the same pages elsewhere.
     pub fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
@@ -1220,7 +1244,7 @@ pub fn alias(to: usize, from: usize, len: usize) -> Result<(), u32> {
 pub fn phys_alloc(pages: &mut [u64]) -> Result<(), u32> {
     let mut state = state();
     if state.pool.is_none() {
-        state.pool = Some(Section::new(0)?);
+        state.pool = Some(Section::physical_pool()?);
     }
     let recycled = pages.len().min(state.pool_free.len());
     let grown = state.pool_pages + (pages.len() - recycled) as u64;
