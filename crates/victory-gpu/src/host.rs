@@ -995,6 +995,50 @@ struct Deferred {
 }
 
 impl Host {
+    /// Scratch for texture copies executed on the single host queue. The recording
+    /// list retains its allocation when a larger copy grows the shared slot.
+    pub(crate) fn texture_copy_scratch(&self, bytes: u64) -> Option<ID3D12Resource> {
+        static BUFFER: Mutex<Option<(u64, ID3D12Resource)>> = Mutex::new(None);
+        let mut slot = BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((size, buffer)) = slot.as_ref()
+            && *size >= bytes
+        {
+            return Some(buffer.clone());
+        }
+        let mut buffer = None;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .ok()?;
+        }
+        let buffer: ID3D12Resource = buffer?;
+        *slot = Some((bytes, buffer.clone()));
+        Some(buffer)
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -1644,8 +1688,8 @@ impl HostList {
         // Lists end, and so start, with depth targets current, not twins.
         let twins = std::mem::take(&mut *self.twins.lock().unwrap_or_else(|e| e.into_inner()));
         for depth in &twins {
-            if let Some(twin) = &depth.twin {
-                self.copy_texture(depth, twin);
+            if let Some(twin) = depth.depth_twin(false) {
+                twin.copy(self, depth, true);
             }
         }
         #[cfg(feature = "diagnostics")]
@@ -1736,7 +1780,7 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        if let Some(twin) = &copy.twin
+        if let Some(twin) = copy.depth_twin(wanted & 0x8 != 0)
             && self.sync_twin(&copy, twin, wanted)
         {
             // Unordered access goes to the twin; the depth stays as it is.
@@ -1825,7 +1869,7 @@ impl HostList {
     /// shortcut: a dispatch that also reads the depth through a shader view
     /// readied after its unordered access view loses its writes (the read
     /// copies the twin back first); whole-texture states cannot have both.
-    fn sync_twin(&self, depth: &HostCopy, twin: &HostCopy, wanted: u32) -> bool {
+    fn sync_twin(&self, depth: &HostCopy, twin: &crate::resource::DepthTwin, wanted: u32) -> bool {
         const UNORDERED_ACCESS: u32 = 0x8;
         let unordered = wanted & UNORDERED_ACCESS != 0;
         let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
@@ -1834,25 +1878,24 @@ impl HostList {
             (true, None) => {
                 twins.push(depth.clone());
                 drop(twins);
-                self.copy_texture(twin, depth);
+                twin.copy(self, depth, false);
             }
             (false, Some(i)) => {
                 twins.swap_remove(i);
                 drop(twins);
-                self.copy_texture(depth, twin);
+                twin.copy(self, depth, true);
             }
             _ => {}
         }
-        if unordered && let Some(barrier) = self.move_to(twin, UNORDERED_ACCESS) {
-            // SAFETY: an open list and a live texture.
-            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        if unordered {
+            for plane in twin.planes() { self.copy_state(plane, UNORDERED_ACCESS); }
         }
         unordered
     }
 
     /// Records a copy of all of `src` into `dst` (a depth target and its
     /// twin), with the transitions it needs.
-    fn copy_texture(&self, dst: &HostCopy, src: &HostCopy) {
+    pub(crate) fn copy_texture(&self, dst: &HostCopy, src: &HostCopy) {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let barriers: Vec<D3D12_RESOURCE_BARRIER> =

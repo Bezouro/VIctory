@@ -472,7 +472,7 @@ fn clear_texture_uav(
     rects: &[Rect],
 ) {
     let (Some((texture, _)), Some(host), Some((heap, index))) = (
-        crate::resource::host_unordered(resource),
+        crate::resource::host_unordered(resource, words),
         crate::host::host(),
         crate::descriptor::clear_uav_slot(gpu, view),
     ) else {

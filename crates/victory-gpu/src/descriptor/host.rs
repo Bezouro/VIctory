@@ -1507,7 +1507,7 @@ pub(crate) fn texture_uav_desc(
     resource: crate::object::This,
     words: Option<&[u32; 10]>,
 ) -> Option<Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>> {
-    let (texture, twin_format) = crate::resource::host_unordered(resource)?;
+    let (texture, twin_format) = crate::resource::host_unordered(resource, words)?;
     let device = &host()?.device;
     let mut desc = words.map(uav_desc);
     // A depth target's twin is typeless: views name a format of its
@@ -1517,7 +1517,16 @@ pub(crate) fn texture_uav_desc(
         use crate::resource::{DEPTH_FORMATS, family};
         let d = desc.get_or_insert_with(|| whole_uav(texture));
         let own = d.Format.0 as u32;
-        if own == 0 || own == family(format) || DEPTH_FORMATS.iter().any(|&(f, _)| f == own)
+        // A combined depth/stencil view names a plane of the guest texture.
+        // The selected writable image has just one plane of its own.
+        match d.ViewDimension {
+            D3D12_UAV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.PlaneSlice = 0,
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => d.Anonymous.Texture2DArray.PlaneSlice = 0,
+            _ => return None,
+        }
+        if own == 0 || own == family(format)
+            || (family(own) == 19 && crate::resource::combined_depth(resource))
+            || DEPTH_FORMATS.iter().any(|&(f, _)| f == own)
         {
             d.Format.0 = format as i32;
         }
@@ -1589,7 +1598,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some((texture, _)) = crate::resource::host_unordered(resource) else {
+            let Some((texture, _)) = crate::resource::host_unordered(resource, desc.as_ref()) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)

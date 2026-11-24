@@ -5,7 +5,6 @@
 use crate::host::{Host, HostList, host};
 use crate::object::This;
 use crate::resource::HostTexture;
-use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
@@ -58,50 +57,6 @@ impl Layout {
     }
 }
 
-// Every host list executes on the same queue. All copies through scratch
-// are GPU-ordered and lists retain earlier allocations if the slot grows.
-fn scratch(host: &Host, bytes: u64) -> Option<ID3D12Resource> {
-    static BUFFER: Mutex<Option<(u64, ID3D12Resource)>> = Mutex::new(None);
-    let mut slot = BUFFER.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((size, buffer)) = slot.as_ref()
-        && *size >= bytes
-    {
-        return Some(buffer.clone());
-    }
-    let mut buffer = None;
-    let desc = D3D12_RESOURCE_DESC {
-        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-        Width: bytes,
-        Height: 1,
-        DepthOrArraySize: 1,
-        MipLevels: 1,
-        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        SampleDesc: DXGI_SAMPLE_DESC {
-            Count: 1,
-            Quality: 0,
-        },
-        ..Default::default()
-    };
-    unsafe {
-        host.device
-            .CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                },
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut buffer,
-            )
-            .ok()?;
-    }
-    let buffer: ID3D12Resource = buffer?;
-    *slot = Some((bytes, buffer.clone()));
-    Some(buffer)
-}
-
 pub(crate) fn copy(list: &HostList, placed: This, address: u64) -> bool {
     let (Some(host), Some(src), Some(dst)) = (
         host(),
@@ -134,7 +89,7 @@ pub(crate) fn copy(list: &HostList, placed: This, address: u64) -> bool {
     {
         return true;
     }
-    let Some(buffer) = scratch(host, layout.bytes) else {
+    let Some(buffer) = host.texture_copy_scratch(layout.bytes) else {
         return false;
     };
     list.copy_state(&src, READ);

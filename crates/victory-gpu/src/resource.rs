@@ -1031,7 +1031,23 @@ pub(crate) struct HostTexture {
     /// A depth target's twin for unordered access ([`host_twin`]), which
     /// its unordered access views name; lists keep the two coherent
     /// (`HostList::transition`).
-    pub(crate) twin: Option<std::sync::Arc<HostTexture>>,
+    pub(crate) twin: Option<std::sync::OnceLock<Option<DepthTwin>>>,
+}
+
+mod depth_twin;
+pub(crate) use depth_twin::DepthTwin;
+
+impl HostTexture {
+    /// Allocate writable storage on first UAV use. Merely binding a DSV or
+    /// creating a depth resource does not allocate the two planes or their scratch.
+    pub(crate) fn depth_twin(&self, make: bool) -> Option<&DepthTwin> {
+        let slot = self.twin.as_ref()?;
+        if make {
+            slot.get_or_init(|| DepthTwin::new(&self.texture)).as_ref()
+        } else {
+            slot.get()?.as_ref()
+        }
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -1074,12 +1090,22 @@ pub(crate) fn scene_surface(
     matches!(format, 28 | 29 | 87 | 91).then(|| copy.clone())
 }
 
+/// A transition of a depth+UAV resource can insert copies before its own barrier.
+pub(crate) fn has_depth_uav(this: This) -> bool {
+    !this.is_null() && resource(this).desc.flags & (2 | 4) == (2 | 4)
+}
+
+pub(crate) fn combined_depth(this: This) -> bool {
+    !this.is_null() && family(resource(this).desc.format) == 19
+}
+
 /// The host texture unordered access views of a title texture name: the
 /// twin of a depth target that has one, with the format such a view takes
 /// when the title's names none or a depth format; else the host copy.
 #[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn host_unordered<'a>(
     this: This,
+    words: Option<&[u32; 10]>,
 ) -> Option<(
     &'a windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     Option<u32>,
@@ -1088,16 +1114,26 @@ pub(crate) fn host_unordered<'a>(
         return None;
     }
     let host = resource(this).host_copy()?;
-    let Some(twin) = &host.twin else {
+    let Some(twin) = host.depth_twin(true) else {
         return Some((&host.texture, None));
     };
-    // SAFETY: a live resource.
-    let typeless = unsafe { twin.texture.GetDesc() }.Format.0 as u32;
-    let format = TWIN_FORMATS
-        .iter()
-        .find(|&&(f, _)| f == typeless)
-        .map(|&(_, f)| f);
-    Some((&twin.texture, format))
+    let plane = match words {
+        None => 0,
+        Some(w) if w[1] == 4 => w[3],
+        Some(w) if w[1] == 5 => w[5],
+        _ => return None,
+    };
+    if twin.planes().len() == 2
+        && words.is_some_and(|w| (w[0] == 21 && plane != 0) || (w[0] == 22 && plane != 1))
+    {
+        return None;
+    }
+    let target = &twin.planes().get(plane as usize)?.texture;
+    // SAFETY: a live twin resource, no conversion within a plane.
+    let format = match unsafe { target.GetDesc() }.Format.0 {
+        53 => 56, 39 => 41, 60 => 62, _ => return None,
+    };
+    Some((target, Some(format)))
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -1316,17 +1352,7 @@ fn make_host_copy(
     let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
     // Depth and unordered access (see `host_texture`).
     const BOTH: u32 = 2 | 4;
-    let twin = (desc.flags & BOTH == BOTH)
-        .then(|| host_twin(&texture))
-        .flatten()
-        .map(|texture| {
-            std::sync::Arc::new(HostTexture {
-                lighting_layout: Default::default(),
-                texture,
-                state: 0.into(),
-                twin: None,
-            })
-        });
+    let twin = (desc.flags & BOTH == BOTH).then(std::sync::OnceLock::new);
     Some(std::sync::Arc::new(HostTexture {
         lighting_layout: Default::default(),
         texture,
@@ -3161,3 +3187,6 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod depth_plane_test;

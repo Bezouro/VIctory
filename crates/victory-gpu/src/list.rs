@@ -323,7 +323,7 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             first: if b.first.is_null() {
                 b.first
             } else {
-                let (texture, _) = crate::resource::host_unordered(b.first)?;
+                let (texture, _) = crate::resource::host_unordered(b.first, None)?;
                 texture.as_raw().cast_const().cast()
             },
             ..*b
@@ -349,33 +349,42 @@ extern "win64" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u
     {
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
-        let mut host: Vec<Barrier> = barriers
-            .iter()
-            .filter_map(|b| host_barrier(list, b))
-            .collect();
-        // Buffers have host copies, not resources the barrier can name:
-        // a barrier on one waits for every shader write before it.
-        if barriers.iter().any(|b| {
-            b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
-        }) {
-            host.push(UAV_BARRIER);
+        let mut pending = Vec::with_capacity(barriers.len());
+        for b in barriers {
+            if b.kind == 0 && crate::resource::has_depth_uav(b.first) {
+                // The transition may record one or more copies immediately. Every
+                // preceding barrier in this call must already be on the command list.
+                flush_barriers(list, &mut pending);
+            }
+            if b.kind == 2 && crate::resource::has_depth_uav(b.first)
+                && let Some(copy) = crate::resource::host_copy(b.first)
+                && let Some(twin) = copy.depth_twin(true)
+            {
+                use windows::core::Interface;
+                for plane in twin.planes() {
+                    pending.push(Barrier { first: plane.texture.as_raw().cast_const().cast(), ..*b });
+                }
+            } else if let Some(host) = host_barrier(list, b) {
+                pending.push(host);
+            } else if b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some() {
+                // A title buffer has host copies: wait for their earlier shader writes.
+                pending.push(UAV_BARRIER);
+            }
         }
-        if !host.is_empty() {
-            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
-            const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
-            // SAFETY: the same layout; borrowed resource pointers, never
-            // released through this slice.
-            let host = unsafe {
-                std::slice::from_raw_parts(
-                    host.as_ptr().cast::<D3D12_RESOURCE_BARRIER>(),
-                    host.len(),
-                )
-            };
-            // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
-        }
+        flush_barriers(list, &mut pending);
     }
     0
+}
+
+fn flush_barriers(list: &crate::host::HostList, pending: &mut Vec<Barrier>) {
+    if pending.is_empty() { return; }
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
+    // SAFETY: same layout and borrowed pointers, live when the list records the barriers.
+    unsafe {
+        list.list.ResourceBarrier(std::slice::from_raw_parts(pending.as_ptr().cast(), pending.len()));
+    }
+    pending.clear();
 }
 
 /// Moves a title texture's host copy to `state` in the list, if needed.
