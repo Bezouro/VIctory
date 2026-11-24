@@ -245,6 +245,8 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// Known MODE[3:2] at the final half of a pixel interpolation.
+    interp_rounding: HashMap<Site, u8>,
     handles: HashMap<(usize, Site, u8, bool, u32, u32), V>,
     /// Runtime stride table entries read in a block, by the descriptor's
     /// load: raw slot, stride, bias and the stride with its class flags.
@@ -323,6 +325,87 @@ struct Lower<'a> {
     /// The host's guard slots ([`Lower::heap_guard`]), view heap then
     /// sampler heap, read once.
     guard_slots: [Option<V>; 2],
+}
+
+/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
+/// after `inst`, from `mode` before it (`None`: not known).
+fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
+    match (inst.name(), &inst.fields) {
+        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
+        (
+            "s_setreg_imm32_b32" | "s_setreg_b32",
+            Fields::Sop {
+                src, imm: Some(h), ..
+            },
+        ) => {
+            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
+            if id != 1 || off >= 4 || off + size <= 2 {
+                return mode;
+            }
+            match src.first() {
+                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
+                    Some((x >> (2 - off) & 3) as u8)
+                }
+                _ => None,
+            }
+        }
+        _ => mode,
+    }
+}
+
+/// The 16/64-bit round mode each block starts with: nearest even at the
+/// program's start, then as the MODE writes on the way set it; `None` where
+/// paths that set it differently join (or a write is not a constant).
+fn round16_entries(p: &crate::ir::Program) -> Vec<Option<u8>> {
+    // None: not reached yet; Some(m): the mode (m None: not known).
+    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
+    entry[0] = Some(Some(0));
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    loop {
+        let mut changed = false;
+        for &b in &order {
+            let Some(mut m) = entry[b] else { continue };
+            for inst in &p.blocks[b].insts {
+                m = round16_after(inst, m);
+            }
+            for s in p.blocks[b].exit.successors() {
+                let new = match entry[s] {
+                    None => Some(m),
+                    Some(old) if old == m => continue,
+                    Some(_) => Some(None),
+                };
+                if entry[s] != new {
+                    entry[s] = new;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            return entry.into_iter().map(Option::flatten).collect();
+        }
+    }
+}
+
+fn interp_rounding(p: &Program, io: &Io) -> HashMap<Site, u8> {
+    let mut modes = HashMap::new();
+    if !io.interps.iter().any(|&((b, i), _)| p.blocks[b].insts[i].name() == "v_interp_p2_f16") {
+        return modes;
+    }
+    // Keep the existing translation of shaders that never select toward-zero
+    // for these results. In a shader that does, switching back to nearest must
+    // also be explicit: a host's legacy conversion can itself round toward zero.
+    if !p.blocks.iter().flat_map(|b| &b.insts).any(|i| round16_after(i, Some(0)) == Some(3)) {
+        return modes;
+    }
+    for (b, mut mode) in round16_entries(p).into_iter().enumerate() {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            if inst.name() == "v_interp_p2_f16" && let Some(known) = mode {
+                modes.insert((b, i), known);
+            }
+            mode = round16_after(inst, mode);
+        }
+    }
+    modes
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -868,6 +951,7 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
+            interp_rounding: interp_rounding(p, x.io),
             half_inputs: half_inputs(&x.native.io, &x.inputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -1994,6 +2078,82 @@ impl<'a> Lower<'a> {
             46,
             &[a, b, c],
         )
+    }
+
+    /// The P2 result, rounded on integer bits. This avoids relying on host
+    /// conversion instructions whose rounding and contraction vary by driver.
+    fn interpolated_half(&mut self, f: V, rtz: bool) -> V {
+        let c = self.cur;
+        let x = self.as_int(f);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k13, k16, k31) = (k(self, 13), k(self, 16), k(self, 31));
+        let t = self.s.m.bin(c, Bin::LShr, x, k16);
+        let m = k(self, 0x8000);
+        let sign = self.s.m.bin(c, Bin::And, t, m);
+        let m = k(self, 0x7FFF_FFFF);
+        let a = self.s.m.bin(c, Bin::And, x, m);
+        // Normal halves: the exponent rebased, the mantissa rounded.
+        let bias = k(self, 0x3800_0000);
+        let rebased = self.s.m.bin(c, Bin::Sub, a, bias);
+        let normal = if rtz {
+            self.s.m.bin(c, Bin::LShr, rebased, k13)
+        } else {
+            let one = k(self, 1);
+            let lsb = self.s.m.bin(c, Bin::LShr, rebased, k13);
+            let lsb = self.s.m.bin(c, Bin::And, lsb, one);
+            let half = k(self, 0xFFF);
+            let up = self.s.m.bin(c, Bin::Add, rebased, half);
+            let up = self.s.m.bin(c, Bin::Add, up, lsb);
+            self.s.m.bin(c, Bin::LShr, up, k13)
+        };
+        let (inf, big) = (k(self, 0x7C00), k(self, if rtz { 0x7BFF } else { 0x7C00 }));
+        let over = self.s.m.cmp(c, pred::IUGE, normal, inf);
+        let normal = self.s.m.select(c, over, big, normal);
+        let infinity = k(self, 0x7F80_0000);
+        let is_inf = self.s.m.cmp(c, pred::EQ, a, infinity);
+        let normal = self.s.m.select(c, is_inf, inf, normal);
+        // Denormal halves: the mantissa shifted into units of 2^-24.
+        let k23 = k(self, 23);
+        let e = self.s.m.bin(c, Bin::LShr, a, k23);
+        let k126 = k(self, 126);
+        let s = self.s.m.bin(c, Bin::Sub, k126, e);
+        let far = self.s.m.cmp(c, pred::IUGT, s, k31);
+        let s = self.s.m.select(c, far, k31, s);
+        let (frac, hidden, zero) = (k(self, 0x7F_FFFF), k(self, 0x80_0000), k(self, 0));
+        let mant = self.s.m.bin(c, Bin::And, a, frac);
+        let mant = self.s.m.bin(c, Bin::Or, mant, hidden);
+        let f32_denormal = self.s.m.cmp(c, pred::EQ, e, zero);
+        let mant = self.s.m.select(c, f32_denormal, zero, mant);
+        let q = self.s.m.bin(c, Bin::LShr, mant, s);
+        let den = if rtz {
+            q
+        } else {
+            let one = k(self, 1);
+            let s1 = self.s.m.bin(c, Bin::Sub, s, one);
+            let half = self.s.m.bin(c, Bin::LShr, mant, s1);
+            let half = self.s.m.bin(c, Bin::And, half, one);
+            let below = self.s.m.bin(c, Bin::Shl, one, s1);
+            let below = self.s.m.bin(c, Bin::Sub, below, one);
+            let rest = self.s.m.bin(c, Bin::And, mant, below);
+            let rest = self.s.m.cmp(c, pred::NE, rest, zero);
+            let rest = self.s.m.cast(c, Cast::ZExt, rest, self.s.t.i32);
+            let lsb = self.s.m.bin(c, Bin::And, q, one);
+            let tie = self.s.m.bin(c, Bin::Or, rest, lsb);
+            let up = self.s.m.bin(c, Bin::And, half, tie);
+            self.s.m.bin(c, Bin::Add, q, up)
+        };
+        let min_normal = k(self, 0x3880_0000);
+        let small = self.s.m.cmp(c, pred::IULT, a, min_normal);
+        let r = self.s.m.select(c, small, den, normal);
+        let is_nan = self.s.m.cmp(c, pred::IUGT, a, infinity);
+        // A NaN keeps the top of its payload, quieted (as the RX 6700 XT,
+        // RDNA2 like the console, converts).
+        let payload = self.s.m.bin(c, Bin::LShr, a, k13);
+        let (low10, quiet) = (k(self, 0x3FF), k(self, 0x7E00));
+        let payload = self.s.m.bin(c, Bin::And, payload, low10);
+        let nan = self.s.m.bin(c, Bin::Or, payload, quiet);
+        let r = self.s.m.select(c, is_nan, nan, r);
+        self.s.m.bin(c, Bin::Or, r, sign)
     }
 
     /// `f` as an f16 in the low bits, rounded toward zero: the nearest-even
@@ -6933,7 +7093,12 @@ impl<'a> Lower<'a> {
                     self.as_int(f)
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
-                    let lo = to_f16(self, f);
+                    let lo = match self.interp_rounding.get(&site) {
+                        Some(0) => self.interpolated_half(f, false),
+                        Some(3) => self.interpolated_half(f, true),
+                        // Preserve the existing lowering for other modes or ambiguous joins.
+                        _ => to_f16(self, f),
+                    };
                     self.low_half(inst, reg, lo)
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.

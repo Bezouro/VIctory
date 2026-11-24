@@ -1915,6 +1915,15 @@ mod barycentric_tests {
         input_addr: u32,
         more: &[SigElement],
     ) -> Result<HostShader, ShaderError> {
+        pixel_inputs(words, input_addr, more, false)
+    }
+
+    fn pixel_inputs(
+        words: &[u32],
+        input_addr: u32,
+        more: &[SigElement],
+        fp16: bool,
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1928,7 +1937,7 @@ mod barycentric_tests {
                     mask: 0b1111,
                     attr: 0,
                     flat: false,
-                    fp16: false,
+                    fp16,
                     pack2: false,
                     row2: 0,
                 }],
@@ -1952,6 +1961,93 @@ mod barycentric_tests {
         let io = io::raise(&p, &native)?;
         let st = st?;
         emit(&c, &native, &p, &st, &io, &res, Target::ANY)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a D3D12 device and DXC"]
+    fn half_interpolation_honors_and_restores_mode_on_the_gpu() {
+        let mut words = Vec::new();
+        for (i, mode) in [None, Some(3), Some(0)].into_iter().enumerate() {
+            if let Some(mode) = mode {
+                // s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), mode
+                words.extend([0xba80_0881, mode]);
+            }
+            words.extend([
+                0xd742_0002,
+                0x0002_0000, // v_interp_p1ll_f16 v2, v0, attr0.x
+                0xd75a_0002,
+                0x040a_0200, // v_interp_p2_f16 v2, v1, attr0.x, v2
+                0x3606_04ff,
+                0x0000_ffff,                          // v_and_b32 v3, 0xffff, v2
+                0x7e00_0d03 | ((4 + i as u32) << 17), // v_cvt_f32_u32 v(4+i), v3
+            ]);
+        }
+        words.extend([
+            0x7e0e_1702, // v_cvt_f32_f16 v7,v2: the restored half widened to a float
+            0xf800_180f,
+            0x0706_0504,
+            0xbf81_0000, // export v4,v5,v6,v7
+        ]);
+        let ps = pixel_inputs(&words, PERSP_CENTER, &[], true).unwrap();
+        let vs_code = crate::hostlib::compile_hlsl(
+            r#"
+            struct Out { float4 attr : TEXCOORD0; float4 p : SV_Position; };
+            Out main(float2 p : POSITION, float a : VALUE) {
+                Out v; v.attr = a.xxxx; v.p = float4(p,0.5,1); return v;
+            }"#,
+            "main",
+            "vs_6_0",
+        )
+        .unwrap();
+        let mut vs = host::stub_vs(&ps).unwrap();
+        vs.dxil = vs_code;
+        let gpu = host::Host::new(false).expect("physical or software D3D12 host");
+        let (root, pso) = gpu.pipeline(&vs, &ps).unwrap();
+        let mut cases = Vec::new();
+        for sign in [1.0f32, -1.0] {
+            // The two pixel centers interpolate x coordinates 1/8 and 3/8
+            // of the distance from the left vertices to the right vertex.
+            let vertices = [
+                -1.,
+                1.,
+                sign,
+                3.,
+                1.,
+                sign * (1. + 1. / 512.),
+                -1.,
+                -3.,
+                sign,
+            ];
+            let texels = gpu
+                .draw(
+                    &root,
+                    &pso,
+                    &host::Draw {
+                        roots: vec![],
+                        textures: &[],
+                        samplers: &[],
+                        vertices: &vertices,
+                        stride: 12,
+                        size: (2, 1),
+                        mesh_groups: 0,
+                    },
+                )
+                .unwrap();
+            let unit = if sign > 0.0 { 0x3c00u16 } else { 0xbc00u16 };
+            let (base, next) = (f32::from(unit), f32::from(unit + 1));
+            let want = vec![
+                [base, base, base, sign],
+                [next, base, next, sign * (1. + 1. / 1024.)],
+            ];
+            eprintln!(
+                "half interpolation sign {sign} [default bits, RTZ bits, restored bits, restored float] got={texels:?} want={want:?}"
+            );
+            cases.push((texels, want));
+        }
+        for (texels, want) in cases {
+            assert_eq!(texels, want);
+        }
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.
