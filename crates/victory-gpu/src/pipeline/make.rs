@@ -20,6 +20,7 @@
 //! `VICTORY_PSO_WAIT_MS` (`0..=5000`) overrides the per-frame budget for every
 //! frame (`0` disables synchronous waiting completely).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -268,15 +269,18 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+    // A missed first draw still identifies a pipeline the next run needs early.
+    if !p.used.swap(true, Ordering::Relaxed) {
+        super::library::note_used(&p.key);
+        if p.made.get().is_none() {
+            WORK.lock().unwrap_or_else(|e| e.into_inner()).promote(p);
+        }
+    }
     if p.made.get().is_none() {
         start(p);
         wait(p, crate::frame::current());
     }
-    let made = p.made.get()?.as_ref();
-    if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
-        super::library::note_used(&p.key);
-    }
-    made
+    p.made.get()?.as_ref()
 }
 
 /// Queues `p` for the workers, once.
@@ -294,6 +298,10 @@ fn start(p: &Arc<Pending>) {
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+        #[cfg(feature = "diagnostics")]
+        if super::skipped_shader(&p.shaders).is_some() {
+            return;
+        }
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p);
     }
@@ -326,19 +334,60 @@ fn wait(p: &Pending, frame: u64) {
     FRAME_BUDGET.refund(frame, reserved_us - elapsed_us);
 }
 
+/// Keep the first-use order of draws within a frame while letting them
+/// overtake a speculative backlog from an earlier launch.
+struct Work {
+    needed: VecDeque<Arc<Pending>>,
+    early: VecDeque<Arc<Pending>>,
+}
+
+impl Work {
+    const fn new() -> Self {
+        Self { needed: VecDeque::new(), early: VecDeque::new() }
+    }
+
+    fn push(&mut self, p: Arc<Pending>) {
+        if p.used.load(Ordering::Relaxed) {
+            self.needed.push_back(p);
+        } else {
+            self.early.push_back(p);
+        }
+    }
+
+    fn promote(&mut self, pipeline: &Arc<Pending>) {
+        if let Some(index) = self.early.iter().position(|p| Arc::ptr_eq(p, pipeline)) {
+            self.needed.push_back(self.early.remove(index).expect("queued pipeline"));
+        }
+    }
+
+    fn pop(&mut self) -> Option<Arc<Pending>> {
+        self.needed.pop_front().or_else(|| self.early.pop_front())
+    }
+}
+
+static WORK: Mutex<Work> = Mutex::new(Work::new());
+static AVAILABLE: Condvar = Condvar::new();
+
+fn finish(p: &Pending) {
+    p.make();
+    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        drained();
+    } else {
+        super::library::save(false);
+    }
+}
+
 /// Hands `p` to the workers (half the logical processors, 2 to 8), started
 /// on first use.
 fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
+    static RUNNING: OnceLock<bool> = OnceLock::new();
+    let running = RUNNING.get_or_init(|| {
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let mut running = false;
         for i in 0..workers {
-            let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
+                .spawn(|| {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     #[cfg(windows)]
@@ -352,26 +401,30 @@ fn queue(p: Arc<Pending>) {
                         libc::setpriority(libc::PRIO_PROCESS, 0, 5);
                     }
                     loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
-                        p.make();
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
+                        let next = {
+                            let mut work = WORK.lock().unwrap_or_else(|e| e.into_inner());
+                            loop {
+                                if let Some(next) = work.pop() {
+                                    break next;
+                                }
+                                work = AVAILABLE.wait(work).unwrap_or_else(|e| e.into_inner());
+                            }
+                        };
+                        finish(&next);
                     }
                 });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
+            match spawned {
+                Ok(_) => running = true,
+                Err(error) => tracing::warn!(%error, "pipeline worker could not start"),
             }
         }
-        sender
+        running
     });
-    if let Err(e) = sender.send(p) {
-        // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
+    if *running {
+        WORK.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+        AVAILABLE.notify_one();
+    } else {
+        finish(&p);
     }
 }
 
@@ -396,6 +449,23 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draws_overtake_background_work_once_in_request_order() {
+        let job = || Arc::new(Pending::new(Vec::new(), None));
+        let (a, b, c) = (job(), job(), job());
+        let mut work = Work::new();
+        for p in [&a, &b, &c] {
+            work.push(p.clone());
+        }
+        work.promote(&c);
+        work.promote(&b);
+        work.promote(&c);
+        for p in [&c, &b, &a] {
+            assert!(Arc::ptr_eq(&work.pop().unwrap(), p));
+        }
+        assert!(work.pop().is_none());
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).

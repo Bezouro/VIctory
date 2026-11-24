@@ -399,7 +399,7 @@ pub fn end_on_signals() {
 
 fn end() {
     // Compiled host pipelines kept for the next run.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     victory_gpu::pipeline::save_pipeline_cache();
     // SAFETY: ends this process, as the console ends a suspended title.
     #[cfg(windows)]

@@ -280,7 +280,7 @@ impl Shader {
 }
 
 #[cfg(feature = "diagnostics")]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
+fn skipped_shader(shaders: &[Arc<Shader>]) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     static WAVE64: OnceLock<Vec<&'static str>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
@@ -294,8 +294,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
     if hashes.is_empty() && wave64.is_empty() {
         return None;
     }
-    p.shaders
-        .iter()
+    shaders.iter()
         .find(|shader| {
             hashes.contains(&shader.hash) || (wave64.contains(&shader.stage) && shader.wave64())
         })
@@ -304,7 +303,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn is_skipped(this: This) -> bool {
-    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+    !this.is_null() && skipped_shader(&pipeline(this).shaders).is_some()
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped
@@ -315,7 +314,7 @@ pub(crate) fn note_drop(this: This) {
         Some("no pipeline set".to_owned())
     } else {
         let p = pipeline(this);
-        skipped_shader(p)
+        skipped_shader(&p.shaders)
             .map(|hash| format!("skipped shader {hash}"))
             .or_else(|| make::missing(&p.host))
     };
