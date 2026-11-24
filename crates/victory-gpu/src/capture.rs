@@ -36,6 +36,66 @@ pub(crate) fn listed(n: u64) -> bool {
 /// every 8th frame: the world, whose frame numbers vary run to run.
 static NEXT_BUSY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Keep the first submission binding a selected pipeline as a standalone RenderDoc
+/// capture. Command lists recorded before capture are included when submitted.
+#[cfg(target_os = "linux")]
+pub(crate) struct SubmissionCapture(extern "C" fn(*mut libc::c_void, *mut libc::c_void) -> u32);
+
+#[cfg(target_os = "linux")]
+impl SubmissionCapture {
+    pub(crate) fn begin(matches: impl FnOnce(&str) -> bool) -> Option<Self> {
+        use std::sync::{OnceLock, atomic::{AtomicBool, Ordering}};
+        static FILTER: OnceLock<Option<String>> = OnceLock::new();
+        static TAKEN: AtomicBool = AtomicBool::new(false);
+        let needle = FILTER.get_or_init(|| std::env::var("VICTORY_CAPTURE_PIPELINE").ok().filter(|s| !s.is_empty())).as_deref()?;
+        if TAKEN.load(Ordering::Relaxed) || !matches(needle) || TAKEN.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        // RenderDoc's public API 1.0.0 prefix, through EndFrameCapture.
+        #[repr(C)]
+        struct Api {
+            preceding: [extern "C" fn(); 19],
+            start: extern "C" fn(*mut libc::c_void, *mut libc::c_void),
+            capturing: extern "C" fn() -> u32,
+            end: extern "C" fn(*mut libc::c_void, *mut libc::c_void) -> u32,
+        }
+        // SAFETY: look up only the preloaded RenderDoc library's public C entry point.
+        let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"RENDERDOC_GetAPI".as_ptr()) };
+        if symbol.is_null() {
+            tracing::warn!("capture pipeline matched without RenderDoc loaded");
+            return None;
+        }
+        type GetApi = unsafe extern "C" fn(i32, *mut *const Api) -> i32;
+        // SAFETY: exact signature of RENDERDOC_GetAPI on Linux.
+        let get: GetApi = unsafe { std::mem::transmute(symbol) };
+        let mut api = std::ptr::null();
+        // SAFETY: RenderDoc owns the versioned table for the lifetime of the process.
+        if unsafe { get(10000, &mut api) } != 1 {
+            return None;
+        }
+        let api = unsafe { api.as_ref() }?;
+        if (api.capturing)() != 0 {
+            return None;
+        }
+        tracing::info!(needle, "capturing host submission");
+        (api.start)(std::ptr::null_mut(), std::ptr::null_mut());
+        ((api.capturing)() != 0).then(|| Self(api.end))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for SubmissionCapture {
+    fn drop(&mut self) {
+        let saved = (self.0)(std::ptr::null_mut(), std::ptr::null_mut());
+        tracing::info!(saved, "finished host submission capture");
+    }
+}
+
+/// The first workload-selected frame has been requested for diagnostics.
+pub fn busy_capture_started() -> bool {
+    NEXT_BUSY.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// At the present of `frame`, after `ran` host draws and dispatches since
 /// the last present: lists a later frame if `VICTORY_CAPTURE_BUSY` says so.
 pub(crate) fn note_busy(frame: u64, ran: u64) {

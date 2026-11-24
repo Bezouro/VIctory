@@ -211,7 +211,7 @@ impl Deadline {
         if milliseconds == INFINITE {
             return Deadline::NEVER;
         }
-        Deadline::after(Duration::from_millis(milliseconds.into()))
+        Deadline::after(victory_gpu::linux::guest_delay(milliseconds))
     }
 
     pub(crate) fn after(duration: Duration) -> Deadline {

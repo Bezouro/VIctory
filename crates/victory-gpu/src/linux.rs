@@ -577,3 +577,50 @@ impl SwapChain {
         unsafe { self.chain.Present(interval, flags.0, std::ptr::null()) }
     }
 }
+
+/// Monotonic clocks exposed to the title (nanoseconds). CPU and GPU system
+/// timestamps must share an epoch, including during diagnostic frame capture.
+pub fn guest_clock_ns(id: libc::clockid_t) -> u64 {
+    let now = clock_ns(id);
+    #[cfg(feature = "diagnostics")]
+    if let Some(&(mono, boot, divisor)) = capture_clock() {
+        let start = if id == libc::CLOCK_BOOTTIME { boot } else { mono };
+        if now > start {
+            return start + (now - start) / divisor;
+        }
+    }
+    now
+}
+
+fn clock_ns(id: libc::clockid_t) -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid timespec for a Linux monotonic clock.
+    unsafe { libc::clock_gettime(id, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+/// Host duration of a finite sleep requested by the title.
+pub fn guest_delay(ms: u32) -> std::time::Duration {
+    let duration = std::time::Duration::from_millis(ms.into());
+    #[cfg(feature = "diagnostics")]
+    if let Some(&(_, _, divisor)) = capture_clock() {
+        return duration * divisor as u32;
+    }
+    duration
+}
+
+#[cfg(feature = "diagnostics")]
+fn capture_clock() -> Option<&'static (u64, u64, u64)> {
+    static SCALE: std::sync::OnceLock<Option<(u64, u64, u64)>> = std::sync::OnceLock::new();
+    if !crate::capture::busy_capture_started() {
+        return None;
+    }
+    SCALE.get_or_init(|| {
+        let divisor = std::env::var("VICTORY_FRAME_CLOCK_DIVISOR").ok()?.parse().ok()?;
+        if !(2..=64).contains(&divisor) {
+            return None;
+        }
+        tracing::info!(divisor, "using a slower title clock during frame capture");
+        Some((clock_ns(libc::CLOCK_MONOTONIC), clock_ns(libc::CLOCK_BOOTTIME), divisor))
+    }).as_ref()
+}

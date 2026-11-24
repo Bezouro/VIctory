@@ -21,7 +21,7 @@ fn clock(id: libc::clockid_t) -> u64 {
 
 pub extern "win64" fn QueryPerformanceCounter(count: *mut i64) -> i32 {
     // SAFETY: the title's out pointer.
-    unsafe { count.write_unaligned((clock(libc::CLOCK_MONOTONIC) / 100) as i64) };
+    unsafe { count.write_unaligned((victory_gpu::linux::guest_clock_ns(libc::CLOCK_MONOTONIC) / 100) as i64) };
     1
 }
 
@@ -32,7 +32,7 @@ pub extern "win64" fn QueryPerformanceFrequency(frequency: *mut i64) -> i32 {
 }
 
 pub extern "win64" fn GetTickCount64() -> u64 {
-    clock(libc::CLOCK_BOOTTIME) / 1_000_000
+    victory_gpu::linux::guest_clock_ns(libc::CLOCK_BOOTTIME) / 1_000_000
 }
 
 pub extern "win64" fn GetTickCount() -> u32 {

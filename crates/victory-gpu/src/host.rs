@@ -1083,6 +1083,10 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(all(feature = "diagnostics", target_os = "linux"))]
+        let capture = crate::capture::SubmissionCapture::begin(|needle| runs.iter().any(|list| {
+            list.pipelines.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|name| name.contains(needle))
+        }));
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1129,6 +1133,8 @@ impl Host {
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
+        #[cfg(all(feature = "diagnostics", target_os = "linux"))]
+        drop(capture);
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.

@@ -208,7 +208,7 @@ pub extern "win64" fn Sleep(ms: u32) {
             std::thread::sleep(Duration::from_secs(3600));
         }
     }
-    std::thread::sleep(Duration::from_millis(ms.into()));
+    std::thread::sleep(victory_gpu::linux::guest_delay(ms));
 }
 
 pub extern "win64" fn SwitchToThread() -> i32 {
