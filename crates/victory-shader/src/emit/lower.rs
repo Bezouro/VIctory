@@ -4192,7 +4192,7 @@ impl<'a> Lower<'a> {
                 let z = self.s.m.i32(0);
                 (self.s.m.select(c, ok, at, z), Some(ok))
             }
-            None => (self.raw_offset(at), None),
+            None => (self.raw_uav_offset(h, at), None),
         };
         let (u, mask, align) = (
             self.s.m.undef(self.s.t.i32),
@@ -4227,27 +4227,39 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, big, k, at)
     }
 
-    /// The bytes the host's raw root view of root parameter `slot` holds from
-    /// its address on: a user-data dword at the parameter's own index (a
-    /// root descriptor's dwords hold no constants), as [`UserData`] with
-    /// [`RootType::Descriptor`] lists it.
+    /// Add the prefix of the aligned host UAV view to an offset relative
+    /// to the title's root view. The physical view bounds the upper end.
+    fn raw_uav_offset(&mut self, h: V, at: V) -> V {
+        let Some(slot) = self.s.root_uavs.iter().find(|r| r.1 == h).map(|r| r.0) else {
+            return self.raw_offset(at);
+        };
+        let bias = self.root_view_data(slot, 1);
+        self.buffer_offset_add(at, bias, true)
+    }
+
+    /// The bytes from the title's view address to its bound end.
     fn root_view_len(&mut self, slot: u8) -> V {
-        let param = self
+        self.root_view_data(slot, 0)
+    }
+
+    /// The raw view's length (dword 0) or its UAV's bias (dword 1), passed
+    /// at the corresponding native address SGPR's user-data index.
+    fn root_view_data(&mut self, slot: u8, dword: u32) -> V {
+        let rp = self
             .x
             .native
             .layout
             .iter()
-            .position(|rp| rp.root == RootType::Descriptor && rp.slot == slot)
+            .find(|rp| rp.root == RootType::Descriptor && rp.slot == slot)
             .expect("a root view's parameter");
-        let rp = self.x.native.layout[param];
-        let index = u32::from(rp.user_data);
+        let index = u32::from(rp.user_data) + dword;
         self.user_reads.insert(
             index,
             UserData {
                 index,
                 slot,
                 root: RootType::Descriptor,
-                dword: 0,
+                dword,
             },
         );
         self.user_dword(index)
@@ -8030,12 +8042,13 @@ impl<'a> Lower<'a> {
         let in_bounds = self.s.m.bin(c, Bin::And, no_wrap, fits);
         // Offsets are accumulated with saturation before entry, so end cannot wrap.
         let at = self.begin_guarded(Some(in_bounds));
+        let address = self.raw_uav_offset(h, off);
         if let Some(value) = value {
-            self.store_buffer_short(h, off, value);
+            self.store_buffer_short(h, address, value);
             self.end_guarded(at, &[]);
             self.end_guarded(access, &[]);
         } else {
-            let value = self.load_buffer_short(h, off, cbv);
+            let value = self.load_buffer_short(h, address, cbv);
             let value = self.end_guarded(at, &[(value, zero)])[0];
             let value = self.end_guarded(access, &[(value, zero)])[0];
             self.write(inst, Reg::V(reg), value, guard);
@@ -8251,31 +8264,34 @@ impl<'a> Lower<'a> {
             l.i32_of(v)
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
-        let mut off = self.s.m.i32(u32::from(*offset));
-        if *offen {
-            let o = vaddr(self, u8::from(*idxen))?;
-            off = self.buffer_offset_add(off, o, halfword);
-        }
-        if !matches!(
-            soffset,
-            Operand::Scalar { code: NULL, .. } | Operand::Const(128)
-        ) {
-            let so = self.operand(inst, soffset)?;
-            off = self.buffer_offset_add(off, so, halfword);
-        }
         let src = self
             .descriptors
             .get(&(site, false))
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        let bounded = halfword
+            || matches!(src, Source::Built { .. })
+                && used.is_some_and(|u| u.kind == ResourceType::Uav);
+        let mut off = self.s.m.i32(u32::from(*offset));
+        if *offen {
+            let o = vaddr(self, u8::from(*idxen))?;
+            off = self.buffer_offset_add(off, o, bounded);
+        }
+        if !matches!(
+            soffset,
+            Operand::Scalar { code: NULL, .. } | Operand::Const(128)
+        ) {
+            let so = self.operand(inst, soffset)?;
+            off = self.buffer_offset_add(off, so, bounded);
+        }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
-            off = self.buffer_offset_add(off, b, halfword);
+            off = self.buffer_offset_add(off, b, bounded);
         }
         if let Some(x) = extra {
-            off = self.buffer_offset_add(off, x, halfword);
+            off = self.buffer_offset_add(off, x, bounded);
         }
         if halfword {
             return self.buffer_short(inst, site, src, off, guard);
@@ -8328,7 +8344,7 @@ impl<'a> Lower<'a> {
                 }
                 None => {
                     let h = self.handle(site, src, false, (11 | u, 0))?;
-                    (h, [self.raw_offset(off), iu, iu])
+                    (h, [self.raw_uav_offset(h, off), iu, iu])
                 }
             };
             let Operand::Vector { reg, .. } = *d else {
@@ -8416,8 +8432,9 @@ impl<'a> Lower<'a> {
                         }
                     }
                     None => {
-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
-                        args.extend([self.raw_offset(off), iu]);
+                        let h = self.handle(site, src, false, (11 | u, 0))?;
+                        args.push(h);
+                        args.extend([self.raw_uav_offset(h, off), iu]);
                     }
                 }
                 args.extend(&vals);

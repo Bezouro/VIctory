@@ -211,6 +211,9 @@ fn spilled_root_uav_writes_overlapping_views_with_guest_offsets_and_bounds() {
     let mem = crate::resource::Memory::zeroed(128, 64).unwrap();
     let address = mem.address();
     let owner = address as usize;
+    let mut expected = std::array::from_fn::<_, 16, _>(|i| 0xf00d0000 | i as u32);
+    // SAFETY: the title allocation covers these sixteen initialized dwords.
+    unsafe { (address as *mut u32).copy_from_nonoverlapping(expected.as_ptr(), 16) };
     crate::shadow::register(owner, address, 64);
     let shadow = crate::shadow::find(address, 64).unwrap();
     let mut mapped = std::ptr::null_mut();
@@ -218,13 +221,22 @@ fn spilled_root_uav_writes_overlapping_views_with_guest_offsets_and_bounds() {
     // The next dword is a guard outside both requested views.
     unsafe {
         shadow.buffer.Map(0, None, Some(&mut mapped)).unwrap();
+        mapped.cast::<u32>().copy_from_nonoverlapping(expected.as_ptr(), 16);
         mapped.cast::<u32>().add(16).write(0xcafef00d);
     }
     let list = host.new_list().unwrap();
     let mut state = crate::draw::State::default();
     state.set_pipeline(pso);
     state.set_heaps(&[heap]);
-    for (base, offset, value) in [(16, 4, 7), (32, 4, 11), (16, 20, 29), (32, 32, 55)] {
+    for (base, offset, value) in [
+        (20, 0, 7),  // bias 4
+        (24, 4, 11), // bias 8
+        (28, 8, 29), // bias 12
+        (32, 12, 31),
+        (20, 40, 47),           // last dword inside the guest view
+        (20, 44, 53),           // first dword outside it
+        (28, u32::MAX - 3, 59), // must not wrap into the aligned prefix
+    ] {
         state.set_view(true, 1, address + base);
         state.set_constants(true, 0, &[offset, value], 0);
         assert!(state.dispatch(&list, 1, 1, 1));
@@ -233,15 +245,18 @@ fn spilled_root_uav_writes_overlapping_views_with_guest_offsets_and_bounds() {
     }
     list.close();
     host.execute(&[&list]);
-    let mut expected = [0u32; 16];
     expected[5] = 7;
-    expected[9] = 29; // the +32 and +16 views addressed the same word
+    expected[7] = 11;
+    expected[9] = 29;
+    expected[11] = 31;
+    expected[15] = 47;
     // SAFETY: execute waited for the fence and copied GPU writes back to title memory.
     unsafe {
         assert_eq!(
             std::slice::from_raw_parts(address as *const u32, 16),
             expected
         );
+        assert_eq!(std::slice::from_raw_parts(mapped.cast::<u32>(), 16), expected);
         assert_eq!(mapped.cast::<u32>().add(16).read(), 0xcafef00d);
         shadow.buffer.Unmap(0, None);
     }

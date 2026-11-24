@@ -93,13 +93,29 @@ pub(crate) struct State {
 // Root descriptors carry no size. Bound both the view and shadow synchronisation.
 const ROOT_UAV_BYTES: u64 = 1 << 20;
 
-/// Backing buffer, byte offset and size of a root UAV's raw descriptor.
-fn root_uav_span(address: u64) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
-    let shadow = crate::shadow::find(address, 4)?;
-    // SAFETY: the shadow retains the buffer enclosing this address.
-    let offset = shadow.gpu(address) - unsafe { shadow.buffer.GetGPUVirtualAddress() };
+struct RootUavSpan {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    /// Start of the raw descriptor in the host copy.
+    offset: u64,
+    /// Guest bytes from the requested address, excluding the prefix.
+    len: u64,
+    bias: u64,
+}
+
+fn root_uav_span(address: u64) -> Option<RootUavSpan> {
+    let shadow = crate::shadow::find_registered(address, 4)?;
+    let offset = shadow.offset(address);
+    if !offset.is_multiple_of(4) {
+        return None;
+    }
     let len = shadow.left(address).min(ROOT_UAV_BYTES) & !3;
-    (offset.is_multiple_of(16) && len != 0).then_some((shadow, offset, len))
+    let bias = offset % 16;
+    Some(RootUavSpan {
+        shadow,
+        offset: offset - bias,
+        len,
+        bias,
+    })
 }
 
 impl Drop for State {
@@ -574,26 +590,6 @@ impl State {
                 }
                 return false;
             }
-            if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
-                for u in &t.host.user_data {
-                    let fresh = made
-                        .iter()
-                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
-                    values[u.index as usize] = match fresh {
-                        Some(&(_, offset)) => offset,
-                        None => self.user_dword(compute, u),
-                    };
-                }
-                // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    }
-                }
-            }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
@@ -626,13 +622,39 @@ impl State {
                     }
                 }
             }
+            let mut root_uav_data = Vec::with_capacity(stage.root_uavs.len());
             for &(slot, param) in &stage.root_uavs {
-                let address = match self.roots_ref(compute).get(usize::from(slot)) {
-                    Some(&Root::View(address)) => address,
-                    _ => return false,
-                };
-                if !self.root_uav_table(list, address, param, compute) {
+                let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                else {
                     return false;
+                };
+                let Some(data) = self.root_uav_table(list, address, param, compute) else {
+                    return false;
+                };
+                root_uav_data.push((slot, data));
+            }
+            if let Some((param, dwords)) = stage.user_data {
+                let mut values = vec![0u32; dwords as usize];
+                for u in &t.host.user_data {
+                    let fresh = made
+                        .iter()
+                        .find(|m| m.0 == u.slot && u.root == RootType::Table);
+                    let raw_uav = (u.root == RootType::Descriptor)
+                        .then(|| root_uav_data.iter().find(|(slot, _)| *slot == u.slot))
+                        .flatten();
+                    values[u.index as usize] = match (fresh, raw_uav) {
+                        (Some(&(_, offset)), _) => offset,
+                        (_, Some((_, data))) => data.get(u.dword as usize).copied().unwrap_or(0),
+                        _ => self.user_dword(compute, u),
+                    };
+                }
+                // SAFETY: an open list; `values` covers the parameter.
+                unsafe {
+                    if compute {
+                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                    } else {
+                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
+                    }
                 }
             }
             if let Some(param) = stage.stride_table {
@@ -658,13 +680,14 @@ impl State {
         true
     }
 
+    /// Bind a root UAV and return its guest length and alignment bias.
     fn root_uav_table(
         &mut self,
         list: &HostList,
         address: u64,
         param: u32,
         compute: bool,
-    ) -> bool {
+    ) -> Option<[u32; 2]> {
         let Some((heap, host)) = self
             .heaps
             .iter()
@@ -673,28 +696,37 @@ impl State {
             .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
         else {
             once!("a root UAV without a bound view heap: the draw is dropped");
-            return false;
+            return None;
         };
         // Resolve afresh in case a nested or replacement guest allocation
         // is now the owner of this address. The descriptor is immutable
         // while this command list can still refer to it.
-        let Some((shadow, offset, len)) = root_uav_span(address) else {
-            once!(address = format_args!("{address:#x}"), "unsupported root UAV range");
-            return false;
+        let Some(RootUavSpan {
+            shadow,
+            offset,
+            len,
+            bias,
+        }) = root_uav_span(address)
+        else {
+            once!(
+                address = format_args!("{address:#x}"),
+                "unsupported root UAV range"
+            );
+            return None;
         };
         let key = (
             std::ptr::from_ref(heap) as usize,
             std::sync::Arc::as_ptr(&shadow) as usize,
             offset,
-            len,
+            len + bias,
         );
         let index = match self.root_uav_slots.get(&key) {
             Some(&index) => index,
             None => {
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return None;
                 };
-                host.raw_uav_at(index, &shadow.buffer, offset, len);
+                host.raw_uav_at(index, &shadow.buffer, offset, len + bias);
                 self.dynamic.push((key.0, index, 1));
                 self.root_uav_slots.insert(key, index);
                 index
@@ -712,7 +744,7 @@ impl State {
                 list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
-        true
+        Some([len as u32, bias as u32])
     }
 
     /// Binds a root SRV as a one-view table (see
@@ -800,7 +832,7 @@ impl State {
                 }
                 (RootType::Descriptor, Some(Root::View(base))) if address >= *base
                     && address - base < ROOT_UAV_BYTES => {
-                    root_uav_span(*base).map(|(_, _, len)| (*base, len))
+                    root_uav_span(*base).map(|span| (*base, span.len))
                 }
                 _ => None,
             };

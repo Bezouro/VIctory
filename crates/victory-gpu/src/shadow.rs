@@ -472,6 +472,15 @@ pub(crate) fn overlapping(from: u64, to: u64, mut visit: impl FnMut(&Arc<Shadow>
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_inner(address, len, true)
+}
+
+/// A shadow for a declared title buffer that contains the whole range.
+pub(crate) fn find_registered(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    find_inner(address, len, false)
+}
+
+fn find_inner(address: u64, len: u64, allow_loose: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -482,7 +491,11 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end);
+        return if allow_loose {
+            loose(address, end)
+        } else {
+            None
+        };
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
