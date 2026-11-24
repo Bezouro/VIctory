@@ -708,6 +708,8 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
             (RootType::Table, 6) => 9 * 32,
             // The root SRV's length: its 32 dwords.
             (RootType::Descriptor, 5) => 32 * 4,
+            // Heap guards: the views these tests bind are all in range.
+            (RootType::ResourceHeap | RootType::SamplerHeap, _) => u32::MAX,
             other => panic!("unexpected user data {other:?}"),
         };
     }

@@ -1061,6 +1061,54 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+fn debug_key(key: &str) -> Option<u8> {
+    Some(match key.trim() {
+        "Enter" => 0x0D,
+        "Esc" => 0x1B,
+        "Tab" => 0x09,
+        "Back" => 0x08,
+        "Up" => 0x26,
+        "Down" => 0x28,
+        "Left" => 0x25,
+        "Right" => 0x27,
+        k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+            k.as_bytes()[0].to_ascii_uppercase()
+        }
+        _ => return None,
+    })
+}
+
+/// Optional interactive input for a diagnostic run. Each line of stdin
+/// is one button press, delivered only to the guest input stream.
+#[cfg(all(feature = "diagnostics", target_os = "linux"))]
+fn stdin_key() -> Option<u8> {
+    use std::io::BufRead;
+    static LAST: std::sync::Mutex<Option<(Instant, u8)>> = std::sync::Mutex::new(None);
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        if std::env::var("VICTORY_STDIN_PAD").as_deref() != Ok("1") {
+            return false;
+        }
+        std::thread::Builder::new()
+            .name("victory-input".into())
+            .spawn(|| {
+                for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+                    if let Some(vk) = debug_key(&line) {
+                        *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), vk));
+                    }
+                }
+            })
+            .is_ok()
+    });
+    if !*ENABLED {
+        return None;
+    }
+    LAST.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .filter(|(at, _)| at.elapsed() < Duration::from_millis(300))
+        .map(|(_, vk)| vk)
+}
+
 /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
 /// 0.2 s that long after input starts, with or without focus. A key is a
 /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
@@ -1071,20 +1119,7 @@ fn scripted() -> Vec<u8> {
         let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
         let keys = list.split(',').filter_map(|entry| {
             let (at, key) = entry.split_once(':')?;
-            let vk = match key.trim() {
-                "Enter" => 0x0D,
-                "Esc" => 0x1B,
-                "Tab" => 0x09,
-                "Back" => 0x08,
-                "Up" => 0x26,
-                "Down" => 0x28,
-                "Left" => 0x25,
-                "Right" => 0x27,
-                k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                    k.as_bytes()[0].to_ascii_uppercase()
-                }
-                _ => return None,
-            };
+            let vk = debug_key(key)?;
             Some((
                 Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                 vk,
@@ -1340,6 +1375,7 @@ mod sdl {
             #[cfg(feature = "diagnostics")]
             let scripted = super::scripted()
                 .into_iter()
+                .chain(super::stdin_key())
                 .filter_map(|vk| (0..=230).filter_map(key).find(|&(v, _)| v == vk));
             #[cfg(not(feature = "diagnostics"))]
             let scripted = std::iter::empty();

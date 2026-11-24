@@ -316,11 +316,13 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             },
             ..*b
         }),
+        // Unordered access to a depth target is to its twin.
         2 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
             } else {
-                host(b.first)?
+                let (texture, _) = crate::resource::host_unordered(b.first)?;
+                texture.as_raw().cast_const().cast()
             },
             ..*b
         }),
@@ -937,6 +939,10 @@ extern "win64" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut
 /// arguments, nothing returned.
 extern "win64" fn ignored_state(_: This) {}
 
+extern "win64" fn depth_bounds(this: This, min: f32, max: f32) {
+    with_state(this, |list, s| s.set_depth_bounds(list, min, max));
+}
+
 /// The title's draw state (decision 0007, step 3), kept for its draws or
 /// set on the host list at once. Without a host GPU these do nothing.
 mod state {
@@ -1312,7 +1318,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, depth_bounds as *const ()),              // 0x220
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -1384,6 +1390,14 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+
+#[cfg(all(test, windows))]
+pub(crate) fn has_newer_table(list: This) -> bool {
+    // SAFETY: one of our lists; its first field is the table. The device
+    // tests can switch layouts, so use this list's table.
+    let table = unsafe { *list.cast::<*const *const ()>() };
+    table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+}
 
 #[cfg(test)]
 mod tests {
