@@ -223,6 +223,12 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// A standalone host command borrowed its own shader-visible view heap.
+    pub(crate) fn invalidate_host_heaps(&mut self) {
+        self.host_heaps = [usize::MAX; 2];
+        self.host_roots = [0; 2];
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {

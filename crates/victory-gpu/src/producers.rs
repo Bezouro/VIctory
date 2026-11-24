@@ -70,8 +70,21 @@ pub(crate) fn record_index(base: u64, stride: u32, max: u32, address: u64) -> Op
 }
 
 #[derive(Debug)]
+pub(crate) struct BufferClear {
+    pub(crate) range: (u64, u64),
+    pub(crate) view: (u64, u64, u64, u64),
+    pub(crate) placed: bool,
+    pub(crate) float: bool,
+    pub(crate) format: Option<u32>,
+    pub(crate) pattern: [u8; 16],
+    pub(crate) pattern_len: usize,
+    pub(crate) gpu_copy: Option<bool>,
+}
+
+#[derive(Debug)]
 enum Event {
     GeometryInput(inputs::Input),
+    Clear(BufferClear),
     Candidate {
         shader: String,
         range: (u64, u64),
@@ -148,6 +161,12 @@ impl Journal {
         r.pack_inputs += u32::from(pack_input);
         r.events.push(event);
         Some(index)
+    }
+
+    pub(crate) fn buffer_clear(&self, clear: BufferClear) {
+        if word().is_none_or(|address| covers(clear.range.0, clear.range.1, address)) {
+            self.add(Event::Clear(clear));
+        }
     }
 
     fn storage(&self) -> Option<&ID3D12Resource> {
@@ -289,6 +308,16 @@ impl Journal {
             };
             match event {
                 Event::GeometryInput(_) => {}
+                Event::Clear(c) => {
+                    if covers(c.range.0, c.range.1, address) {
+                        let phase = ((address - c.range.0) % c.pattern_len as u64) as usize;
+                        let value = u32::from_le_bytes(std::array::from_fn(|i| c.pattern[(phase + i) % c.pattern_len]));
+                        tracing::info!(fence, list_index, recording=r.id, order, address=format_args!("{address:#x}"),
+                            view_base=format_args!("{:#x}",c.view.0), first=c.view.1, elements=c.view.2,
+                            stride=c.view.3, format=?c.format, placed=c.placed, float=c.float,
+                            range=?c.range, value, gpu_copy=?c.gpu_copy, "submitted UAV clear covering indirect X");
+                    }
+                }
                 Event::Candidate {
                     shader,
                     range,

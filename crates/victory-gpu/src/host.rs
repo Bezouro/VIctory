@@ -58,9 +58,13 @@ pub(crate) struct Host {
     dsvs: ID3D12DescriptorHeap,
     dsv_size: u32,
     next_dsv: AtomicU32,
+    /// A CPU-only slot. A clear consumes its descriptor during recording.
+    clear_uav: Mutex<ID3D12DescriptorHeap>,
     /// With `VICTORY_D3D12_DEBUG` set (diagnostics builds): the debug
     /// layer's messages.
     messages: Option<ID3D12InfoQueue>,
+    #[cfg(test)]
+    pub(crate) debug_issues: AtomicU32,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
 }
@@ -251,6 +255,11 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let clear_uav = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: 1,
+            ..Default::default()
+        })?;
         tracing::info!("host D3D12 device ready");
         // DXC's first compile, while nothing is guarded yet (see there).
         #[cfg(not(windows))]
@@ -269,7 +278,10 @@ fn create() -> windows::core::Result<Host> {
             dsvs,
             dsv_size,
             next_dsv: AtomicU32::new(0),
+            clear_uav: Mutex::new(clear_uav),
             messages,
+            #[cfg(test)]
+            debug_issues: AtomicU32::new(0),
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
         })
@@ -904,7 +916,12 @@ enum Step {
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    GpuWrite(
+        std::sync::Arc<crate::shadow::Shadow>,
+        usize,
+        usize,
+        Option<Box<[u8]>>,
+    ),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -1208,12 +1225,15 @@ impl Host {
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+                if let Step::GpuWrite(shadow, address, len, clear) = step {
+                    if let Some(pattern) = clear {
+                        shadow.expect_cleared(*address, *len, pattern);
+                    }
+                    if !back.iter().any(|(s, a, l)| {
+                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
+                    }) {
+                        back.push((shadow.clone(), *address, *len));
+                    }
                 }
             }
         }
@@ -1362,6 +1382,10 @@ impl Host {
                     let text = String::from_utf8_lossy(text);
                     let text = text.trim_end_matches('\0');
                     tracing::warn!(id = m.ID.0, severity = m.Severity.0, "D3D12: {text}");
+                    #[cfg(test)]
+                    if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                        self.debug_issues.fetch_add(1, Ordering::Relaxed);
+                    }
                     if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 && first_error.is_none() {
                         first_error = Some(text.to_owned());
                     }
@@ -1404,6 +1428,33 @@ impl Host {
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
         }
+    }
+
+    pub(crate) fn with_clear_uav(
+        &self,
+        list: &HostList,
+        heap: &ID3D12DescriptorHeap,
+        texture: &ID3D12Resource,
+        desc: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>,
+        record: impl FnOnce(D3D12_CPU_DESCRIPTOR_HANDLE),
+    ) {
+        list.keep(heap);
+        let cpu_heap = self.clear_uav.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a live texture and a CPU-only slot held through recording.
+        let handle = unsafe {
+            let handle = cpu_heap.GetCPUDescriptorHandleForHeapStart();
+            self.device.CreateUnorderedAccessView(
+                texture,
+                None::<&ID3D12Resource>,
+                desc.map(std::ptr::from_ref),
+                handle,
+            );
+            handle
+        };
+        // SAFETY: the guest list invalidates its cached heap and roots after
+        // this operation. Its next draw or dispatch rebinds guest tables.
+        unsafe { list.list.SetDescriptorHeaps(&[Some(heap.clone())]) };
+        record(handle);
     }
 }
 
@@ -1877,8 +1928,21 @@ impl HostList {
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, None));
     }
+
+    pub(crate) fn defer_gpu_clear(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+        pattern: Box<[u8]>,
+    ) {
+        self.deferred()
+            .copies
+            .push(Step::GpuWrite(shadow.clone(), address, len, Some(pattern)));
+    }
+
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
@@ -2030,7 +2094,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, _) => {
                     // The shaders start from the title's data.
                     batch.flush();
                     shadow.writing(*address, *len);

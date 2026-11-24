@@ -592,6 +592,14 @@ impl HostHeap {
         }
     }
 
+    pub(crate) fn gpu(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: this heap is shader-visible and the caller found a mirrored slot.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart() };
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + u64::from(index) * u64::from(self.step),
+        }
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -1429,6 +1437,38 @@ fn whole_uav(texture: &ID3D12Resource) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     desc
 }
 
+/// The same host UAV description for the shader-visible mirror and the
+/// CPU-only descriptor used by a clear.
+pub(crate) fn texture_uav_desc(
+    resource: crate::object::This,
+    words: Option<&[u32; 10]>,
+) -> Option<Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>> {
+    let (texture, twin_format) = crate::resource::host_unordered(resource)?;
+    let device = &host()?.device;
+    let mut desc = words.map(uav_desc);
+    // A depth target's twin is typeless: views name a format of its
+    // family; a depth one, the typeless one or none becomes the one
+    // with the depth's bits.
+    if let Some(format) = twin_format {
+        use crate::resource::{DEPTH_FORMATS, family};
+        let d = desc.get_or_insert_with(|| whole_uav(texture));
+        let own = d.Format.0 as u32;
+        if own == 0 || own == family(format) || DEPTH_FORMATS.iter().any(|&(f, _)| f == own)
+        {
+            d.Format.0 = format as i32;
+        }
+    } else if let Some(desc) = desc.as_mut()
+        && desc.Format.0 == 0
+        && let Some(format) = crate::resource::view_format(resource)
+    {
+        desc.Format = DXGI_FORMAT(format as i32);
+    }
+    if !fits(device, texture, desc.as_mut().map(|d| &mut d.Format), true) {
+        return None;
+    }
+    Some(desc)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -1485,7 +1525,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some((texture, twin_format)) = crate::resource::host_unordered(resource) else {
+            let Some((texture, _)) = crate::resource::host_unordered(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
@@ -1493,27 +1533,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     _ => None,
                 };
             };
-            let mut desc = desc.as_ref().map(uav_desc);
-            // A depth target's twin is typeless: views name a format of its
-            // family; a depth one, the typeless one or none becomes the one
-            // with the depth's bits.
-            if let Some(format) = twin_format {
-                use crate::resource::{DEPTH_FORMATS, family};
-                let d = desc.get_or_insert_with(|| whole_uav(texture));
-                let own = d.Format.0 as u32;
-                if own == 0 || own == family(format) || DEPTH_FORMATS.iter().any(|&(f, _)| f == own)
-                {
-                    d.Format.0 = format as i32;
-                }
-            } else if let Some(desc) = desc.as_mut()
-                && desc.Format.0 == 0
-                && let Some(format) = crate::resource::view_format(resource)
-            {
-                desc.Format = DXGI_FORMAT(format as i32);
-            }
-            if !fits(device, texture, desc.as_mut().map(|d| &mut d.Format), true) {
-                return None;
-            }
+            let desc = texture_uav_desc(resource, desc.as_ref())?;
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(

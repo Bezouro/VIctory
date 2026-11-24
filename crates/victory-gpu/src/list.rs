@@ -10,6 +10,8 @@
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod uav_clear;
+
 use std::mem::offset_of;
 
 use crate::object::{
@@ -716,6 +718,7 @@ extern "win64" fn resolve(
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct Rect {
     left: i32,
     top: i32,
@@ -1290,7 +1293,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -1331,6 +1334,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, uav_clear::uint as *const ()),            // 0x1a8
+    (54, uav_clear::float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, depth_bounds as *const ()),              // 0x220
