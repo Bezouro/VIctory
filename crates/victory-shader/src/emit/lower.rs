@@ -1409,8 +1409,15 @@ impl<'a> Lower<'a> {
                 Reg::V(_) if matches!(io_inputs.get(&v), Some(Input::Barycentric { .. })) => {
                     continue;
                 }
-                Reg::S(_) => match io_inputs.get(&v) {
+                Reg::S(reg) => match io_inputs.get(&v) {
                     Some(&input) => self.input(input),
+                    // An SSA join can have an incoming edge on which a
+                    // temporary has never been written. Keep user and system
+                    // inputs distinct from ordinary uninitialised registers.
+                    None if matches!(&self.x.native.io, StageIo::Cs(cs)
+                        if reg < 102 && reg >= cs.user_sgprs()
+                            + ((cs.rsrc2 >> 7) & 15).count_ones() as u8
+                            + (cs.rsrc2 & 1) as u8) => Val::I32(self.s.m.i32(0)),
                     None => Val::Missing("a hardware SGPR input"),
                 },
                 Reg::Scc => Val::Missing("SCC on entry"),
