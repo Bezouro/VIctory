@@ -92,6 +92,55 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// Integer render targets cannot blend. Keep the effective blend and
+    /// write mask for the other targets, including when the title shares RT0.
+    fn host_blend(&self) -> D3D12_BLEND_DESC {
+        let mut blend = self.blend;
+        let shared = !self.blend.IndependentBlendEnable.as_bool();
+        for (slot, format) in self
+            .targets
+            .RTFormats
+            .iter()
+            .copied()
+            .enumerate()
+            .take(self.targets.NumRenderTargets as usize)
+        {
+            let integer = matches!(
+                format,
+                DXGI_FORMAT_R32G32B32A32_UINT
+                    | DXGI_FORMAT_R32G32B32A32_SINT
+                    | DXGI_FORMAT_R32G32B32_UINT
+                    | DXGI_FORMAT_R32G32B32_SINT
+                    | DXGI_FORMAT_R16G16B16A16_UINT
+                    | DXGI_FORMAT_R16G16B16A16_SINT
+                    | DXGI_FORMAT_R32G32_UINT
+                    | DXGI_FORMAT_R32G32_SINT
+                    | DXGI_FORMAT_R10G10B10A2_UINT
+                    | DXGI_FORMAT_R8G8B8A8_UINT
+                    | DXGI_FORMAT_R8G8B8A8_SINT
+                    | DXGI_FORMAT_R16G16_UINT
+                    | DXGI_FORMAT_R16G16_SINT
+                    | DXGI_FORMAT_R32_UINT
+                    | DXGI_FORMAT_R32_SINT
+                    | DXGI_FORMAT_R8G8_UINT
+                    | DXGI_FORMAT_R8G8_SINT
+                    | DXGI_FORMAT_R16_UINT
+                    | DXGI_FORMAT_R16_SINT
+                    | DXGI_FORMAT_R8_UINT
+                    | DXGI_FORMAT_R8_SINT
+            );
+            let original = self.blend.RenderTarget[if shared { 0 } else { slot }];
+            if integer && original.BlendEnable.as_bool() {
+                if !blend.IndependentBlendEnable.as_bool() {
+                    blend.RenderTarget.fill(original);
+                    blend.IndependentBlendEnable = true.into();
+                }
+                blend.RenderTarget[slot].BlendEnable = false.into();
+            }
+        }
+        blend
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -676,7 +725,7 @@ impl HostPipeline {
             VS: code(0),
             GS: gs_code,
             PS: code(1),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: raster,
             DepthStencilState: g.depth,
@@ -868,7 +917,7 @@ fn stream_pipeline<S, D>(
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         stages,
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
         mask: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
             g.sample_mask,
@@ -977,6 +1026,44 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn integer_targets_disable_only_their_own_blending() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 4;
+        g.targets.RTFormats[..4].copy_from_slice(&[
+            DXGI_FORMAT_R8_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16_SINT,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+        ]);
+        let shared = &mut g.blend.RenderTarget[0];
+        shared.BlendEnable = true.into();
+        shared.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        shared.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        shared.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED.0 as u8;
+        let mut integer = *shared;
+        integer.BlendEnable = false.into();
+        let actual = g.host_blend();
+        assert!(actual.IndependentBlendEnable.as_bool());
+        assert_eq!(
+            actual.RenderTarget[..4],
+            [
+                integer,
+                g.blend.RenderTarget[0],
+                integer,
+                g.blend.RenderTarget[0]
+            ]
+        );
+
+        g.blend.IndependentBlendEnable = true.into();
+        g.blend.RenderTarget[2].BlendEnable = true.into();
+        g.blend.RenderTarget[3] = g.blend.RenderTarget[0];
+        let mut expected = g.blend;
+        expected.RenderTarget[0].BlendEnable = false.into();
+        expected.RenderTarget[2].BlendEnable = false.into();
+        assert_eq!(g.host_blend(), expected);
+    }
+
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };
         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
@@ -988,6 +1075,40 @@ mod tests {
             t[0] = uint3(0, 1, 2);
         }";
     const PS: &str = "float4 main() : SV_Target { return 1; }";
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Vulkan mesh shaders and DXC"]
+    fn a_mesh_pipeline_can_blend_color_and_write_an_integer_target() {
+        let gpu = host().expect("a Vulkan device is required");
+        let ms = victory_shader::hostlib::compile_hlsl(MS, "main", "ms_6_5").unwrap();
+        let ps = victory_shader::hostlib::compile_hlsl(
+            "struct Outputs { float4 color : SV_Target0; uint mask : SV_Target1; };
+            Outputs main() { Outputs o; o.color = float4(1, 0, 1, 0.5); o.mask = 42; return o; }",
+            "main",
+            "ps_6_5",
+        )
+        .unwrap();
+        let (root, _) = root_signature(&gpu.device, &[], &[], false).unwrap();
+        let mut g = GraphicsState::default();
+        g.depth.DepthEnable = false.into();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8_UINT;
+        let blend = &mut g.blend.RenderTarget[0];
+        blend.BlendEnable = true.into();
+        blend.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        mesh_pipeline(
+            &gpu.device,
+            &root,
+            code(&ms),
+            code(&ps),
+            &g,
+            "mixed integer target test",
+        )
+        .expect("a mesh pipeline with an integer render target and color blending");
+    }
 
     /// The PC `dxc.exe` (`VICTORY_PC_DXC`, else the newest Windows SDK's).
     fn dxc() -> Option<PathBuf> {
