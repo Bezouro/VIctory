@@ -64,7 +64,7 @@ pub(crate) fn note_busy(frame: u64, ran: u64) {
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some() && (n.is_power_of_two() || listed(n) || n == SCENE_CAPTURE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
@@ -345,9 +345,19 @@ fn scene_extent() -> Option<(u64, u32)> {
     })
 }
 
-pub(crate) fn take_scene() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+/// Capture exponentially spaced frames of the selected scene, even when
+/// the first world draws are too sparse to trigger a busy-frame capture.
+static SCENE_CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn take_scene(frame: u64) -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
     scene_extent()?;
-    SCENE.lock().unwrap_or_else(|e| e.into_inner()).take()
+    let scene = SCENE.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    if folder().is_some() && (COUNT.fetch_add(1, Relaxed) + 1).is_power_of_two() {
+        SCENE_CAPTURE.store(frame, Relaxed);
+    }
+    Some(scene)
 }
 
 /// Notes a title texture the frame being built renders to or writes.
