@@ -2308,12 +2308,12 @@ mod tests {
             footprint: PlacedFootprint,
         }
         type CopyRegion =
-            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
-        type CopyRes = extern "system" fn(This, This, This);
-        type Resolve = extern "system" fn(This, This, u32, This, u32, u32);
-        type Close = extern "system" fn(This) -> HRESULT;
-        type Reset = extern "system" fn(This, This, This) -> HRESULT;
-        type Execute = extern "system" fn(This, u32, *const This);
+            extern "win64" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        type CopyRes = extern "win64" fn(This, This, This);
+        type Resolve = extern "win64" fn(This, This, u32, This, u32, u32);
+        type Close = extern "win64" fn(This) -> HRESULT;
+        type Reset = extern "win64" fn(This, This, This) -> HRESULT;
+        type Execute = extern "win64" fn(This, u32, *const This);
 
         for fmt in PACKED_16 {
             let rt = make_tex(fmt, 1 | 4, 1);
