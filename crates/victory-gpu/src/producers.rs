@@ -1,7 +1,7 @@
 //! Observe one exact indirect dispatch X argument across command-list recordings.
 //! A reflected table UAV is a possible destination. Only a change bracketed
 //! by GPU copies around a submitted command proves that its value changed.
-pub(crate) mod batch;
+pub(crate) mod inputs;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -49,7 +49,7 @@ pub(crate) fn select_mesh(pipeline: crate::object::This, arguments: u64, stride:
         && LEARNED.set(arguments).is_ok()
     {
         tracing::info!(hash, address = format_args!("{arguments:#x}"), "selected terrain indirect X");
-        batch::select(arguments);
+        inputs::select(arguments);
     }
 }
 
@@ -71,19 +71,13 @@ pub(crate) fn record_index(base: u64, stride: u32, max: u32, address: u64) -> Op
 
 #[derive(Debug)]
 enum Event {
-    BatchInput(batch::Input),
+    GeometryInput(inputs::Input),
     Candidate {
         shader: String,
         range: (u64, u64),
         status: String,
         buffer: Option<usize>,
         samples: bool,
-    },
-    PackInput {
-        output: (u64, u64),
-        stride: u32,
-        elements: u32,
-        back: ID3D12Resource,
     },
     Consumer {
         pipeline: String,
@@ -104,7 +98,7 @@ struct Recording {
     events: Vec<Event>,
     omitted: u32,
     pack_inputs: u32,
-    batch_bytes: u64,
+    input_bytes: u64,
 }
 
 #[derive(Default)]
@@ -128,24 +122,24 @@ impl Journal {
         r.events.clear();
         r.omitted = 0;
         r.pack_inputs = 0;
-        r.batch_bytes = 0;
+        r.input_bytes = 0;
         r.id = 0;
     }
 
     fn add(&self, event: Event) -> Option<usize> {
         let mut r = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        let pack_input = matches!(&event, Event::PackInput { .. });
+        let pack_input = matches!(&event, Event::GeometryInput(i) if i.is_pack());
         // At most 32 small committed readbacks per command-list recording.
         if r.events.len() == LIMIT || (pack_input && r.pack_inputs >= 32) {
             r.omitted = r.omitted.saturating_add(1);
             return None;
         }
-        if let Event::BatchInput(input) = &event {
-            if r.batch_bytes + input.bytes() > batch::BUDGET {
+        if let Event::GeometryInput(input) = &event {
+            if r.input_bytes + input.bytes() > inputs::BUDGET {
                 r.omitted = r.omitted.saturating_add(1);
                 return None;
             }
-            r.batch_bytes += input.bytes();
+            r.input_bytes += input.bytes();
         }
         if r.id == 0 {
             r.id = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
@@ -228,22 +222,6 @@ impl Journal {
         }
     }
 
-    /// Capture the packed source indices that this direct dispatch can actually read.
-    /// The unsigned index is encoded in the low 29 bits, the shift in the high three.
-    pub(crate) fn pack_input(list: &HostList, source: (u64, u64), elements: u32, output: (u64, u64), stride: u32) {
-        let bytes = u64::from(elements) * 4;
-        if elements == 0 || elements > 16384 || bytes > source.1 { return; }
-        let Some(shadow) = crate::shadow::find(source.0, bytes) else { return };
-        let Some(bound) = list.bound_buffer_state(&shadow.buffer) else { return };
-        let Some(back) = crate::host::readback_buffer(bytes) else { return };
-        if list.producers.add(Event::PackInput { output, stride, elements, back: back.clone() }).is_none() { return; }
-        list.buffer_state(&shadow.buffer, BUFFER_READ);
-        // SAFETY: both buffers cover the validated range. Binding retains the source
-        // until execution and the journal owns the readback until list reset.
-        unsafe { list.list.CopyBufferRegion(&back, 0, &shadow.buffer, shadow.offset(source.0), bytes) };
-        list.buffer_state(&shadow.buffer, bound);
-    }
-
     pub(crate) fn consumer(
         list: &HostList,
         pipeline: String,
@@ -288,7 +266,7 @@ impl Journal {
         let address = word();
         if unique_completed {
             for (order, event) in r.events.iter().enumerate() {
-                if let Event::BatchInput(input) = event {
+                if let Event::GeometryInput(input) = event {
                     input.complete(fence, list_index, r.id, order);
                 }
             }
@@ -310,7 +288,7 @@ impl Journal {
                     .then(|| unsafe { ptr.cast::<u32>().add(order * 2 + dword).read() })
             };
             match event {
-                Event::BatchInput(_) => {}
+                Event::GeometryInput(_) => {}
                 Event::Candidate {
                     shader,
                     range,
@@ -322,22 +300,6 @@ impl Journal {
                     let changed = before.zip(after).map(|(a, b)| a != b);
                     tracing::info!(fence, list_index, recording=r.id, order, address=format_args!("{address:#x}"),
                         shader, range=?range, status, ?buffer, ?before, ?after, ?changed, "indirect X producer candidate");
-                }
-                Event::PackInput { output, stride, elements, back } => {
-                    if !covers(output.0, output.1, address) { continue; }
-                    let offset = address - output.0;
-                    if !offset.is_multiple_of(u64::from(*stride)) { continue; }
-                    let Ok(record) = u32::try_from(offset / u64::from(*stride)) else { continue };
-                    let mut data = std::ptr::null_mut();
-                    let hits = if unique_completed && unsafe { back.Map(0, None, Some(&mut data)) }.is_ok() && !data.is_null() {
-                        // SAFETY: the fence completed and the copy covered this many u32s.
-                        let words = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), *elements as usize) };
-                        let hits = words.iter().filter(|word| **word & 0x1fff_ffff == record).count();
-                        unsafe { back.Unmap(0, None) };
-                        Some(hits)
-                    } else { None };
-                    tracing::info!(fence, list_index, recording=r.id, order, record, elements, ?hits,
-                        "submitted PackInstances input membership");
                 }
                 Event::Consumer {
                     pipeline,

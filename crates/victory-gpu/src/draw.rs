@@ -863,7 +863,7 @@ impl State {
         if let (Some(records), Some(tiles)) =
             (range(ResourceType::Srv, 82), range(ResourceType::Srv, 79))
         {
-            crate::producers::batch::capture(
+            crate::producers::inputs::batch(
                 list,
                 records,
                 tiles,
@@ -876,20 +876,38 @@ impl State {
     }
 
     #[cfg(feature = "diagnostics")]
-    fn sample_pack_input(&self, list: &HostList, p: &HostPipeline, groups: [u32; 3]) {
-        // This layout applies to the identified PackInstances kernel only.
-        if p.name != "[compute c1488f485ad606fb]" || groups[1..] != [1, 1] { return; }
-        let word = crate::producers::word();
-        if word.is_none() && crate::producers::mesh_selector().is_none() { return; }
-        let Some(Root::Constants(c)) = self.compute.get(1) else { return };
-        let [items, stride, ..] = c.as_slice() else { return };
-        if *stride == 0 { return; }
-        let range = |kind, register| self.compute_table_buffer(p, kind, register);
-        let Some(output) = range(ResourceType::Uav, 8) else { return };
-        if word.is_some_and(|x| !crate::producers::covers(output.0, output.1, x)) { return; }
-        if let Some(source) = range(ResourceType::Srv, 83) {
-            crate::producers::Journal::pack_input(list, source, (*items).min(groups[0].saturating_mul(64)), output, *stride);
+    fn sample_pack_input(
+        &self,
+        list: &HostList,
+        p: &HostPipeline,
+        groups: [u32; 3],
+    ) -> Option<crate::producers::inputs::AfterPack> {
+        if p.name != "[compute c1488f485ad606fb]" || groups[1..] != [1, 1] {
+            return None;
         }
+        let x = crate::producers::word();
+        if x.is_none() && crate::producers::mesh_selector().is_none() {
+            return None;
+        }
+        let Root::Constants(c) = self.compute.get(1)? else {
+            return None;
+        };
+        let [items, stride, ..] = c.as_slice() else {
+            return None;
+        };
+        let out = self.compute_table_buffer(p, ResourceType::Uav, 8)?;
+        if x.is_some_and(|x| !crate::producers::covers(out.0, out.1, x)) {
+            return None;
+        }
+        let t83 = self.compute_table_buffer(p, ResourceType::Srv, 83)?;
+        crate::producers::inputs::before_pack(
+            list,
+            t83,
+            (*items).min(groups[0].saturating_mul(64)),
+            out,
+            *stride,
+            x,
+        )
     }
 
     /// Runs a dispatch on the host.
@@ -928,7 +946,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
-        self.sample_pack_input(list, p, [x, y, z]);
+        let pack = self.sample_pack_input(list, p, [x, y, z]);
         #[cfg(feature = "diagnostics")]
         self.sample_batch_input(list, p, [x, y, z]);
         #[cfg(feature = "diagnostics")]
@@ -937,6 +955,8 @@ impl State {
         let producer = self.sample_producer(list);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        if let Some(sample) = pack { sample.after(list); }
         #[cfg(feature = "diagnostics")]
         crate::producers::Journal::after(list, producer);
         #[cfg(feature = "diagnostics")]

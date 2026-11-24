@@ -1,5 +1,8 @@
-//! Fence-completed inputs of CS_BatchCullBatchCSMeshlets. The mesh draw can
+//! Fence-completed BatchCull groups and PackInstances counters. The mesh draw can
 //! first expose its indirect X address after these dispatches were recorded.
+mod pack;
+pub(crate) use pack::{AfterPack, before_pack};
+
 use super::{Event, covers};
 use crate::host::{BUFFER_READ, HostList};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -11,10 +14,22 @@ pub(super) const BUDGET: u64 = 8 << 20;
 struct Layout {
     output: Range,
     stride: u32,
-    group_base: u32,
-    dispatched: u32,
-    records: u32,
-    table_words: u32,
+    kernel: Kernel,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum Kernel {
+    Batch {
+        group_base: u32,
+        dispatched: u32,
+        records: u32,
+        table_words: u32,
+    },
+    Pack {
+        elements: u32,
+        start_word: u64,
+        counter_words: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -47,7 +62,22 @@ struct Snapshot {
 
 impl Input {
     pub(super) fn bytes(&self) -> u64 {
-        u64::from(self.layout.records) * 16 + u64::from(self.layout.table_words) * 4
+        match self.layout.kernel {
+            Kernel::Batch {
+                records,
+                table_words,
+                ..
+            } => u64::from(records) * 16 + u64::from(table_words) * 4,
+            Kernel::Pack {
+                elements,
+                counter_words,
+                ..
+            } => u64::from(elements) * 4 + u64::from(counter_words) * 8,
+        }
+    }
+
+    pub(super) fn is_pack(&self) -> bool {
+        matches!(self.layout.kernel, Kernel::Pack { .. })
     }
 
     fn snapshot(
@@ -66,7 +96,7 @@ impl Input {
                 list_index,
                 recording,
                 order,
-                "could not map BatchCull inputs"
+                "could not map geometry compute inputs"
             );
             return None;
         }
@@ -127,7 +157,7 @@ pub(super) fn select(x: u64) {
     if pending.evicted != 0 {
         tracing::warn!(
             evicted = pending.evicted,
-            "BatchCull input history limit reached"
+            "geometry compute input history limit reached"
         );
     }
     for snap in pending.inputs {
@@ -136,8 +166,8 @@ pub(super) fn select(x: u64) {
 }
 
 impl Snapshot {
-    fn evidence(&self, record: u32) -> Evidence {
-        let (groups, table) = self.words.split_at(self.layout.records as usize * 4);
+    fn batch_evidence(&self, records: u32, record: u32) -> Evidence {
+        let (groups, table) = self.words.split_at(records as usize * 4);
         let mut hit_groups = Vec::new();
         let mut hits = 0;
         for (group, data) in groups.chunks_exact(4).enumerate() {
@@ -162,16 +192,26 @@ impl Snapshot {
         };
         let (fence, list_index, recording, order) =
             (self.fence, self.list_index, self.recording, self.order);
-        let e = self.evidence(record);
+        let Kernel::Batch {
+            group_base,
+            dispatched,
+            records,
+            ..
+        } = self.layout.kernel
+        else {
+            self.report_pack(record);
+            return;
+        };
+        let e = self.batch_evidence(records, record);
         for (group, [a, b, c, d]) in e.hit_groups {
             tracing::info!(fence, list_index, recording, order, record, group,
-                source_record=u64::from(self.layout.group_base)+u64::from(group),
+                source_record=u64::from(group_base)+u64::from(group),
                 t82=?[a,b,c,d], mesh_slot=a & 0x1f_ffff,
                 matrix_slot=b & 0x1f_ffff, cull_flags=(a>>21)&7,
                 instance_base=d & 0xffff, "submitted BatchCull input group");
         }
         tracing::info!(fence, list_index, recording, order, record, hits=e.hits,
-            dispatched=self.layout.dispatched, captured=self.layout.records, t79=?e.tile,
+            dispatched, captured=records, t79=?e.tile,
             sentinel=e.tile.map(|v|v==u32::MAX), "submitted BatchCull input membership");
     }
 }
@@ -191,14 +231,16 @@ fn output_record((base, len): Range, stride: u32, x: u64) -> Option<u32> {
         return None;
     }
     let delta = x - base;
-    if !delta.is_multiple_of(u64::from(stride)) { return None; }
+    if !delta.is_multiple_of(u64::from(stride)) {
+        return None;
+    }
     u32::try_from(delta / u64::from(stride)).ok()
 }
 
 /// Copies the t82 records addressed by GroupID.x plus the root base, and
 /// the t79 entries addressable by the output view. Never refresh title
 /// memory here: bind() has already established the actual GPU inputs.
-pub(crate) fn capture(
+pub(crate) fn batch(
     list: &HostList,
     t82: Range,
     t79: Range,
@@ -245,13 +287,15 @@ pub(crate) fn capture(
         layout: Layout {
             output,
             stride,
-            group_base: base,
-            dispatched: groups,
-            records: records as u32,
-            table_words: table_words as u32,
+            kernel: Kernel::Batch {
+                group_base: base,
+                dispatched: groups,
+                records: records as u32,
+                table_words: table_words as u32,
+            },
         },
     };
-    if list.producers.add(Event::BatchInput(event)).is_none() {
+    if list.producers.add(Event::GeometryInput(event)).is_none() {
         return;
     }
     for (src, guest, len, dest, state) in [
@@ -320,7 +364,7 @@ mod tests {
         }
         let list = host.new_list().unwrap();
         list.buffer_state(&shadow.buffer, BUFFER_READ);
-        capture(
+        batch(
             &list,
             (start, 64),
             (start + t79_word as u64 * 4, 1232 * 4),
@@ -336,18 +380,18 @@ mod tests {
             .records
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let [Event::BatchInput(input)] = r.events.as_slice() else {
+        let [Event::GeometryInput(input)] = r.events.as_slice() else {
             panic!("missing GPU snapshot")
         };
         let mut pending = Waiting::default();
         pending.push(input.snapshot(1, 0, 1, 0).unwrap());
         let snap = pending.inputs.pop_front().unwrap();
         let record = output_record(snap.layout.output, snap.layout.stride, 0x661a8f0).unwrap();
-        let hit = snap.evidence(record);
+        let hit = snap.batch_evidence(2, record);
         assert_eq!(hit.hits, 1);
         assert_eq!(hit.hit_groups, [(1, expected)]);
         assert_eq!(hit.tile, Some(0xfedc_0001));
-        assert_eq!(snap.evidence(207).hits, 0);
+        assert_eq!(snap.batch_evidence(2, 207).hits, 0);
         crate::shadow::unregister(key, start);
     }
 }
