@@ -3796,6 +3796,13 @@ impl<'a> Lower<'a> {
                     }
                     (props, None)
                 }
+                // Scalar loads use the same raw SRV as smem(). The shader
+                // can test descriptor word 2 before reading that buffer.
+                Fields::Smem { .. } if un.starts_with("s_buffer_load_dword")
+                    && used.is_some_and(|r| r.kind == ResourceType::Srv) =>
+                {
+                    ((11, 0), None)
+                }
                 _ => return Err("a scalar memory read as data"),
             };
             (first, src, props, image, uav)
