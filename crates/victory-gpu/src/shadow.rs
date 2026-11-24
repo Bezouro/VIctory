@@ -45,6 +45,13 @@ pub(crate) struct Shadow {
     before: Mutex<Option<(usize, Vec<u8>)>>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: runs in copy-back between its read of title memory and its
+    /// write, as a title thread's write would.
+    static AFTER_READ: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
@@ -219,6 +226,7 @@ impl Shadow {
             const PIECE: usize = 64 << 10;
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
+            let mut runs: Vec<(usize, usize)> = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -232,19 +240,34 @@ impl Shadow {
                     // takes the title's bytes in turn, and so does the
                     // snapshot: to a later range that overlaps this one,
                     // they are not a shader's write to put back.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    #[cfg(test)]
+                    AFTER_READ.with(|hook| {
+                        if let Some(f) = hook.borrow().as_ref() { f(); }
+                    });
+                    runs.clear();
+                    for (i, ((t, h), o)) in title.iter_mut().zip(host.iter_mut()).zip(old).enumerate() {
                         if *h != *o && *t != *h {
                             *t = *h;
-                            changed = true;
+                            match runs.last_mut() {
+                                Some((_, end)) if *end == i => *end += 1,
+                                _ => runs.push((i, i + 1)),
+                            }
                         }
                         *h = *t;
                         *o = *t;
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                    if let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) {
+                        crate::watch::writing(start + at + first, last - first);
+                        let count = crate::host::write_changed(start + at, title, &runs);
+                        written += count;
+                        if count < runs.iter().map(|(a, b)| b - a).sum() {
+                            // A title page disappeared or lost write access. Its
+                            // current contents must be read before the next use.
+                            let page = (start + at) / PAGE - start / PAGE;
+                            self.copied.lock().unwrap_or_else(|e| e.into_inner())[page] = 0;
+                            at += n;
+                            continue;
+                        }
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -621,5 +644,27 @@ mod tests {
         s.copy_back(base, 2 * PAGE);
         assert_eq!(peek(base + 8), 2, "the title's newer byte");
         assert_eq!(peek(base + 3), 9, "the shader's byte");
+    }
+    /// A title thread writes the page while copy-back has it read: only the
+    /// bytes the shader wrote go back, so the title's write stays.
+    #[test]
+    fn a_title_write_during_copy_back_stays() {
+        let Some((_memory, base, s)) = title() else {
+            return; // no host GPU here
+        };
+        let copy = |at: usize| s.data as usize + (at - base);
+        s.update(base, PAGE);
+        s.writing(base, PAGE);
+        poke(copy(base + 100), 9);
+        poke(copy(base + 101), 8);
+        AFTER_READ.with(|f| *f.borrow_mut() = Some(Box::new(move || poke(base + 4000, 7))));
+        s.copy_back(base, PAGE);
+        AFTER_READ.with(|f| *f.borrow_mut() = None);
+        assert_eq!(
+            (peek(base + 100), peek(base + 101)),
+            (9, 8),
+            "the shader's bytes"
+        );
+        assert_eq!(peek(base + 4000), 7, "the title's write in between");
     }
 }

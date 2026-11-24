@@ -2252,39 +2252,101 @@ pub(crate) fn readable(at: *const u8, len: usize) -> bool {
     })
 }
 
-/// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
-///
-/// Through [`read`]: the kernel refuses an unmapped destination page as it
-/// does a source page. `WriteProcessMemory` makes the same copy, but asks
-/// for the destination's region first, at `VirtualQuery`'s cost (see
-/// [`copy_mapped`]): 0.35 ms for each piece of the world's copy-back, 39 ms
-/// per frame.
-pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    let write = |at: usize, n: usize| {
-        let from = src.wrapping_add(at - dst as usize);
-        #[cfg(windows)]
-        {
-            use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-            use windows_sys::Win32::System::Threading::GetCurrentProcess;
-            let mut done = 0;
-            // SAFETY: the source is our mapped host copy; the kernel checks
-            // the destination.
-            unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+/// Scatter the shader's changed bytes back into the title. A write elsewhere
+/// in the same page by a title thread must survive the copy.
+pub(crate) fn write_changed(dst: usize, bytes: &[u8], runs: &[(usize, usize)]) -> usize {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut written = 0;
+        for &(start, end) in runs {
+            let mut pos = start;
+            while pos < end {
+                let at = dst + pos;
+                let part = (4096 - at % 4096).min(end - pos);
+                let mut done = 0;
+                // SAFETY: the kernel checks the destination, and the source
+                // slice covers the complete requested range.
+                unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, bytes[pos..pos + part].as_ptr().cast(), part, &mut done) };
+                written += done;
+                pos += part;
+            }
         }
-        #[cfg(not(windows))]
-        read(from, at as *mut u8, n)
-    };
-    if len == 0 || write(dst as usize, len) {
-        return;
+        written
     }
-    for_pieces(dst as usize, len, 64 << 10, |at, n| {
-        if !write(at, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
-            });
+    #[cfg(not(windows))]
+    {
+        // The *local* iovecs are destinations: copy_to_user also works on
+        // GPU device mappings which cannot be pinned as remote iovecs.
+        const BATCH: usize = 256;
+        let mut local = Vec::with_capacity(runs.len().min(BATCH));
+        let mut remote = Vec::with_capacity(local.capacity());
+        let (mut index, mut skip, mut written) = (0, 0, 0);
+        while index < runs.len() {
+            local.clear();
+            remote.clear();
+            let mut request = 0;
+            for (j, &(a, b)) in runs[index..].iter().take(BATCH).enumerate() {
+                let start = if j == 0 { a + skip } else { a };
+                let part = &bytes[start..b];
+                local.push(libc::iovec { iov_base: (dst + start) as *mut _, iov_len: part.len() });
+                remote.push(libc::iovec { iov_base: part.as_ptr().cast_mut().cast(), iov_len: part.len() });
+                request += part.len();
+            }
+            // SAFETY: live iovec arrays. The kernel checks every destination
+            // even if another title thread changes a mapping during the copy.
+            let done = unsafe {
+                libc::process_vm_readv(libc::getpid(), local.as_ptr(), local.len() as _,
+                                      remote.as_ptr(), remote.len() as _, 0)
+            };
+            if done < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            let mut advance = done.max(0) as usize;
+            written += advance;
+            if advance == request {
+                index += local.len();
+                skip = 0;
+                continue;
+            }
+            if advance == 0 {
+                let (start, end) = runs[index];
+                let pos = start + skip;
+                advance = (4096 - (dst + pos) % 4096).min(end - pos);
+            }
+            while advance > 0 {
+                let (a, b) = runs[index];
+                let step = advance.min(b - a - skip);
+                skip += step;
+                advance -= step;
+                if skip == b - a {
+                    index += 1;
+                    skip = 0;
+                }
+            }
         }
-    });
+        written
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn scatter_copy_preserves_gaps_and_resumes_after_an_inaccessible_page() {
+    use victory_loader::linux::vm::*;
+    let base = alloc(0, GRANULARITY, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, PAGE).unwrap();
+    let hole = base + PAGE;
+    protect(hole, PAGE, PAGE_NOACCESS).unwrap();
+    let source = vec![0x55u8; 3 * PAGE];
+    let ranges = [(7, 9), (PAGE - 2, 2 * PAGE + 2), (2 * PAGE + 4, 2 * PAGE + 5)];
+    assert_eq!(write_changed(base, &source, &ranges), 7);
+    // SAFETY: first and third pages remain readable.
+    let first = unsafe { std::slice::from_raw_parts(base as *const u8, PAGE) };
+    let third = unsafe { std::slice::from_raw_parts((base + 2 * PAGE) as *const u8, PAGE) };
+    assert_eq!(&first[6..10], &[0, 0x55, 0x55, 0]);
+    assert_eq!(&first[PAGE - 2..], &[0x55, 0x55]);
+    assert_eq!(&third[..6], &[0x55, 0x55, 0, 0, 0x55, 0]);
+    free(base, 0, MEM_RELEASE).unwrap();
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
@@ -2368,14 +2430,14 @@ mod title_copies {
     fn copy_back_writes_mapped_pages_only() {
         let from = pattern();
         let to = holed(0xee);
-        write_mapped(to, from.as_ptr(), 3 * BLOCK);
+        write_changed(to as usize, &from, &[(0, 3 * BLOCK)]);
         assert_eq!(block(to, 0), &from[..BLOCK]);
         assert_eq!(block(to, 2), &from[2 * BLOCK..]);
         release(to);
         // Neither aligned nor whole: the bytes around the range stay.
         let to = holed(0xee);
         // SAFETY: inside the first block.
-        write_mapped(unsafe { to.add(100) }, from.as_ptr(), BLOCK - 300);
+        write_changed(to as usize + 100, &from, &[(0, BLOCK - 300)]);
         let first = block(to, 0);
         assert_eq!(first[100..BLOCK - 200], from[..BLOCK - 300]);
         let around = first[..100].iter().chain(&first[BLOCK - 200..]);
@@ -2388,7 +2450,7 @@ mod title_copies {
             unsafe { VirtualProtect(to.add(2 * BLOCK).cast(), BLOCK, PAGE_READONLY, &mut old) };
         assert_ne!(protected, 0);
         // SAFETY: the third block.
-        write_mapped(unsafe { to.add(2 * BLOCK) }, from.as_ptr(), BLOCK);
+        write_changed(to as usize + 2 * BLOCK, &from, &[(0, BLOCK)]);
         assert!(block(to, 2).iter().all(|&b| b == 0xee));
         release(to);
     }
