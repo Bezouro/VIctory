@@ -380,7 +380,17 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, raw: *mut libc:
     // another illegal opcode may end at an unmapped page boundary.
     if signal == libc::SIGILL && trap == 6 {
         let byte = |pc: u64| asm::read64(pc & !7).map(|v| (v >> ((pc & 7) * 8)) as u8);
-        if byte(rip) == Some(0x0f) && byte(rip + 1) == Some(0x01) {
+        let prefix = byte(rip);
+        let fp = uc.uc_mcontext.fpregs;
+        if matches!(prefix, Some(0x66 | 0xf2)) && !fp.is_null() {
+            // SAFETY: the kernel-supplied FXSAVE area contains 16 XMM registers at offset 160.
+            let regs = unsafe { &mut *fp.cast::<u8>().add(160).cast::<[[u64; 2]; 16]>() };
+            if let Some(n) = crate::sse4a::emulate(|i| byte(rip + i as u64), regs) {
+                uc.uc_mcontext.gregs[libc::REG_RIP as usize] += n as i64;
+                return;
+            }
+        }
+        if prefix == Some(0x0f) && byte(rip + 1) == Some(0x01) {
             match byte(rip + 2) {
                 // MONITORX and MWAITX are hints. The guest checks the wait condition again.
                 Some(0xfa | 0xfb) => {

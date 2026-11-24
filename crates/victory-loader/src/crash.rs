@@ -246,49 +246,11 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
 }
 const CMP_FLAGS: u32 = 0x8d5;
 
-/// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
 unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
-    // SAFETY: the caller's code bytes are readable up to the instruction's end.
-    let b = |i: usize| unsafe { code.add(i).read() };
-    let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 {
-        (b(1), 2)
-    } else {
-        (0, 1)
-    };
-    if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
-        return None;
-    }
-    let modrm = b(at + 2);
-    if modrm >> 6 != 3 {
-        return None;
-    }
-    let dst = usize::from((modrm >> 3) & 7 | (rex & 4) << 1);
-    let src = usize::from(modrm & 7 | (rex & 1) << 3);
-    let immediate = b(at + 1) == 0x78;
-    let (fields, len) = if immediate {
-        ((b(at + 3), b(at + 4)), at + 5)
-    } else {
-        // extrq reads its fields from src's low half, insertq from its high.
-        let f = if prefix == 0x66 { xmm[src].Low } else { xmm[src].High as u64 };
-        ((f as u8, (f >> 8) as u8), at + 3)
-    };
-    let (n, at_bit) = (u32::from(fields.0 & 63), u32::from(fields.1 & 63));
-    let bits = if n == 0 { 64 } else { n };
-    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-    if prefix == 0x66 {
-        // extrq: register form takes its fields from src, works on dst.
-        if immediate && (modrm >> 3) & 7 != 0 {
-            return None;
-        }
-        let target = if immediate { src } else { dst };
-        xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
-    } else {
-        let value = (xmm[src].Low & mask) << at_bit;
-        xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
-    }
-    Some(len)
+    // SAFETY: M128A consists of the two consecutive 64-bit halves of an XMM register.
+    let regs = unsafe { &mut *std::ptr::from_mut(xmm).cast::<[[u64; 2]; 16]>() };
+    // SAFETY: the caller supplies the faulting instruction, readable through its last byte.
+    crate::sse4a::emulate(|i| Some(unsafe { code.add(i).read() }), regs)
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {

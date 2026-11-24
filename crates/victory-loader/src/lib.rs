@@ -27,6 +27,8 @@ mod crash;
 mod crash_log;
 #[cfg(target_os = "linux")]
 pub mod linux;
+#[cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+mod sse4a;
 pub mod prepare;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
