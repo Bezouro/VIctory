@@ -363,7 +363,7 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, raw: *mut libc:
     {
         return;
     }
-    let fault = Fault {
+    let mut fault = Fault {
         signal,
         si_code: si.si_code,
         trap,
@@ -374,6 +374,39 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, raw: *mut libc:
         // SAFETY: our arguments.
         unsafe { host_fault(signal, info, raw, rip, fault.address) };
         return;
+    }
+
+    // Zen 2 CLZERO is absent on Intel. Read exactly the instruction bytes:
+    // another illegal opcode may end at an unmapped page boundary.
+    if signal == libc::SIGILL && trap == 6 {
+        let byte = |pc: u64| asm::read64(pc & !7).map(|v| (v >> ((pc & 7) * 8)) as u8);
+        if byte(rip) == Some(0x0f) && byte(rip + 1) == Some(0x01) {
+            match byte(rip + 2) {
+                // MONITORX and MWAITX are hints. The guest checks the wait condition again.
+                Some(0xfa | 0xfb) => {
+                    if byte(rip + 2) == Some(0xfb) {
+                        // SAFETY: no arguments or guest pointers.
+                        unsafe { libc::sched_yield() };
+                    }
+                    uc.uc_mcontext.gregs[libc::REG_RIP as usize] += 3;
+                    return;
+                }
+                Some(0xfc) => {
+                    let line = g[libc::REG_RAX as usize] as usize & !63;
+                    super::watch::open(line, 64);
+                    let zero = [0u8; 64];
+                    let source = libc::iovec { iov_base: zero.as_ptr().cast_mut().cast(), iov_len: 64 };
+                    let dest = libc::iovec { iov_base: line as *mut _, iov_len: 64 };
+                    // SAFETY: the kernel checks the guest destination and reads 64 bytes of our array.
+                    if unsafe { libc::process_vm_writev(libc::getpid(), &source, 1, &dest, 1, 0) } == 64 {
+                        uc.uc_mcontext.gregs[libc::REG_RIP as usize] += 3;
+                        return;
+                    }
+                    fault = Fault { signal: libc::SIGSEGV, trap: 14, error: 2, address: line as u64, si_code: 0 };
+                }
+                _ => {}
+            }
+        }
     }
 
     let rsp = g[libc::REG_RSP as usize] as u64;
@@ -408,7 +441,7 @@ extern "C" fn on_signal(signal: i32, info: *mut libc::siginfo_t, raw: *mut libc:
     record_from(&fault, context, record);
     if overflow {
         record.code = STATUS_STACK_OVERFLOW; // a probe below a stack that still has room
-    } else if record.code == STATUS_ACCESS_VIOLATION && signal == libc::SIGSEGV {
+    } else if record.code == STATUS_ACCESS_VIOLATION && fault.signal == libc::SIGSEGV {
         let hook = GUARD_HOOK.load(Ordering::Acquire);
         // SAFETY: a hook the region table set, with the signature it was set with.
         if hook != 0 && unsafe { std::mem::transmute::<usize, fn(usize) -> bool>(hook) }(fault.address as usize) {

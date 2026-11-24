@@ -2,12 +2,24 @@
 # Launch the native runtime with a read-only title and per-user saves.
 set -euo pipefail
 
-if [[ $# -lt 1 || $# -gt 2 || ( $# == 2 && $2 != --bind-only ) ]]; then
-    echo "Usage: $0 /path/to/title.exe [--bind-only]" >&2
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 /path/to/title.exe [--bind-only] [--console series-x|series-s]" >&2
     exit 2
 fi
 exe=$(realpath -e -- "$1")
 [[ -f $exe ]] || { echo "Expected an executable file" >&2; exit 2; }
+shift
+mode=(--execute)
+console_args=()
+while (( $# )); do
+    case "$1" in
+        --bind-only) mode=(); shift ;;
+        --console)
+            [[ ${2:-} == series-x || ${2:-} == series-s ]] || { echo "Expected series-x or series-s" >&2; exit 2; }
+            console_args=(--console "$2"); shift 2 ;;
+        *) echo "Unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
 title=$(dirname -- "$exe")
 repo=$(dirname -- "$(dirname -- "$(realpath -- "$0")")")
 bin=$(realpath -e -- "${VICTORY_BIN:-$repo/target/release/victory}")
@@ -20,10 +32,8 @@ for writable in "$cache" "$data"; do
     fi
 done
 mkdir -p -- "$cache" "$data"
-args=(--execute)
-if [[ ${2:-} == --bind-only ]]; then args=(); fi
 exec bwrap --die-with-parent --unshare-pid --ro-bind / / --dev-bind /dev /dev --proc /proc \
     --bind "$cache" "$cache" --bind "$data" "$data" --ro-bind "$title" "$title" \
     --chdir "$cache" --setenv VICTORY_GAME_DIR "$title" \
     --setenv VICTORY_CACHE_DIR "$cache" --setenv VICTORY_DATA_DIR "$data" \
-    --setenv VKD3D_SHADER_CACHE_PATH "$cache" -- "$bin" run "$exe" "${args[@]}"
+    --setenv VKD3D_SHADER_CACHE_PATH "$cache" -- "$bin" run "$exe" "${mode[@]}" "${console_args[@]}"
