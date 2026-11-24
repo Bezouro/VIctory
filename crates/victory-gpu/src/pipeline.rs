@@ -192,6 +192,8 @@ pub(crate) fn bound(this: This) {
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::validation::first_bind(p.host.is_ready());
     let frame = crate::frame::current();
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
@@ -206,6 +208,21 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stage_names(this: This) -> String {
+    { let p = pipeline(this); format!("{:?} key={}", p.shaders, p.host.key()) }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn compute_miss(this: This) {
+    crate::validation::compute_pipeline_miss(!this.is_null() && pipeline(this).host.pending());
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn has_shader(this: This, hash: &str) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| s.hash == hash)
 }
 
 /// Select compute pipelines whose root arguments are traced at recording.
@@ -240,7 +257,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(feature = "diagnostics")]
-fn parse_shader_hashes(value: &str) -> Vec<String> {
+pub(crate) fn parse_shader_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)

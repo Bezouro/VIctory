@@ -18,8 +18,8 @@
 //! compile reliably, then [`STEADY_BUDGET_MS`] (8 ms) once presenting steadily
 //! so live gameplay avoids large compile hitches. Setting
 //! `VICTORY_PSO_WAIT_MS` (`0..=5000`) overrides the per-frame budget for every
-//! frame (`0` disables synchronous waiting completely). Without an explicit
-//! wait budget, Linux resolves compute pipelines at first dispatch so later
+//! frame for budgeted waits (`0` disables these waits). Linux resolves
+//! required compute pipelines at first dispatch so later
 //! draws see the data that dispatch produces.
 
 use std::collections::VecDeque;
@@ -76,6 +76,17 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn key(&self) -> &str { &self.key }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn pending(&self) -> bool { self.made.get().is_none() }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn is_ready(&self) -> bool {
+        self.made.get().is_some_and(Option::is_some)
     }
 
     fn make(&self) {
@@ -277,7 +288,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        if cfg!(target_os = "linux") && configured_wait_ms().is_none()
+        if compute_on_demand()
             && matches!(p.shaders.as_slice(), [cs] if cs.stage == "compute")
         {
             // The GPU might consume this dispatch's results only once. An
@@ -292,6 +303,17 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         }
     }
     p.made.get()?.as_ref()
+}
+
+fn compute_on_demand() -> bool {
+    if !cfg!(target_os = "linux") { return false; }
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: OnceLock<bool> = OnceLock::new();
+        return *ON.get_or_init(|| std::env::var("VICTORY_COMPUTE_POLICY").as_deref() != Ok("budget"));
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    true
 }
 
 /// Claim an unstarted job from any priority queue. OnceLock in Pending::make

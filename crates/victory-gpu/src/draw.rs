@@ -63,6 +63,8 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    #[cfg(feature = "diagnostics")]
+    target_formats: Vec<i32>,
     depth: usize,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
@@ -266,6 +268,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        #[cfg(feature = "diagnostics")]
+        self.target_formats.clear();
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -279,6 +283,11 @@ impl State {
                 continue;
             };
             self.targets.push(record.resource as usize);
+            #[cfg(feature = "diagnostics")]
+            if crate::validation::enabled() {
+                let format = record.desc().map_or_else(|| unsafe { texture.GetDesc().Format }, |view| view.Format);
+                self.target_formats.push(format.0);
+            }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
@@ -670,14 +679,16 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::compute_miss(self.pipeline as This);
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -685,15 +696,15 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            return;
+            return false;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -704,6 +715,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::capture::MeshStats::end(list, query);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -756,10 +768,14 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     let query = crate::capture::MeshStats::begin(list, self.pipeline as This,
                         crate::capture::MeshCommand::Direct { groups: x }, &self.targets);
+                    #[cfg(feature = "diagnostics")]
+                    let validation = crate::validation::Draws::begin(list);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     #[cfg(feature = "diagnostics")]
                     crate::capture::MeshStats::end(list, query);
+                    #[cfg(feature = "diagnostics")]
+                    crate::validation::Draws::end(list, validation, self.pipeline as This, &self.targets, &self.target_formats);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1047,11 +1063,15 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let validation = crate::validation::Draws::begin(list);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            crate::validation::Draws::end(list, validation, self.pipeline as This, &self.targets, &self.target_formats);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1134,11 +1154,15 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let validation = crate::validation::Draws::begin(list);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            crate::validation::Draws::end(list, validation, self.pipeline as This, &self.targets, &self.target_formats);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1203,6 +1227,8 @@ impl State {
         // budget. A pipeline still being compiled cannot use either.
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             #[cfg(feature = "diagnostics")]
+            if kind == DISPATCH { crate::pipeline::compute_miss(self.pipeline as This); }
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         };
@@ -1255,6 +1281,8 @@ impl State {
         } else if kind == DISPATCH {
             crate::capture::MeshStats::begin_compute(list, &p.name, None)
         } else { None };
+        #[cfg(feature = "diagnostics")]
+        let validation = if kind == DISPATCH { None } else { crate::validation::Draws::begin(list) };
         crate::indirect::execute(
             list,
             &signature,
@@ -1267,6 +1295,8 @@ impl State {
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
+            #[cfg(feature = "diagnostics")]
+            crate::validation::Draws::end(list, validation, self.pipeline as This, &self.targets, &self.target_formats);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true

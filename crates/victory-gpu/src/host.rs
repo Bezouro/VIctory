@@ -697,6 +697,8 @@ pub(crate) struct HostList {
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
     #[cfg(feature = "diagnostics")]
+    pub(crate) validation: Mutex<crate::validation::Draws>,
+    #[cfg(feature = "diagnostics")]
     pub(crate) mesh_stats: OnceLock<Option<crate::capture::MeshStats>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
@@ -1045,6 +1047,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                validation: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 mesh_stats: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
@@ -1161,6 +1165,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         if unsafe { self.fence.GetCompletedValue() } >= *submitted {
             for list in runs {
+                if crate::validation::enabled() { list.validation.lock().unwrap_or_else(|e| e.into_inner()).completed(); }
                 if let Some(Some(stats)) = list.mesh_stats.get() { stats.report(); }
             }
         }
@@ -1508,6 +1513,8 @@ impl HostList {
             }
         }
         #[cfg(feature = "diagnostics")]
+        if crate::validation::enabled() { self.validation.lock().unwrap_or_else(|e| e.into_inner()).resolve(&self.list); }
+        #[cfg(feature = "diagnostics")]
         if let Some(Some(stats)) = self.mesh_stats.get() { stats.resolve(&self.list); }
         // The buffers it used back to common, where the next list's prelude
         // expects them.
@@ -1540,6 +1547,8 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        #[cfg(feature = "diagnostics")]
+        if crate::validation::enabled() { self.validation.lock().unwrap_or_else(|e| e.into_inner()).reset(); }
         #[cfg(feature = "diagnostics")]
         if let Some(Some(stats)) = self.mesh_stats.get() { stats.reset(); }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();

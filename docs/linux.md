@@ -232,10 +232,24 @@ The slope shader comes from [the upstream rendering experiment](https://github.c
 
 On Linux the first dispatch that needs a compute pipeline claims its build
 or waits for the worker already compiling it. This preserves one-shot writes
-such as the inputs to later indirect mesh draws. An explicit
-`VICTORY_PSO_WAIT_MS` uses the shared per-frame budget for compute as well
-as graphics. Cold compute compiles can stall the first frame that uses them.
+such as the inputs to later indirect mesh draws. Diagnostics can reproduce the previous behaviour with
+`VICTORY_COMPUTE_POLICY=budget`, including its shared per-frame wait budget. Cold compute compiles can stall the first frame that uses them.
 
 `VICTORY_TRACE_COMPUTE` takes comma-separated shader hashes. The diagnostics
 log includes root constants, buffer views and the GPU's compute invocation
 count after submission. Mesh and compute queries share 32 entries per list.
+
+With `VICTORY_VALIDATE=1`, each present logs cumulative counts of compute
+calls requested and discarded, pipeline objects ready at first guest bind,
+and graphics calls on fence-completed command lists. Each graphics call also
+receives a pipeline-statistics query. Active counts calls with vertex, clipper
+or fragment invocations. Shaded counts those with fragment invocations.
+Each ExecuteIndirect counts as one API call and may execute multiple records.
+A mesh group that emits nothing can remain invisible to the legacy counters.
+
+`VICTORY_COMPARE_PASSES` selects a shader by hash and snapshots the host
+colour slots after matching draws numbered by `VICTORY_COMPARE_OCCURRENCES`.
+The log identifies the complete pipeline and view formats. Eight-bit RGBA
+and BGRA targets preserve alpha in PNG. Packed RGB10A2 targets use a
+reversible mapping to 16-bit RGBA PNG. Readback is of the single-sample,
+single-subresource target at draw time and is saved after its fence signals.

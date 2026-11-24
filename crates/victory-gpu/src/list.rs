@@ -1085,7 +1085,9 @@ mod state {
     }
     pub(super) extern "win64" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        let mut ran = false;
+        with_state(this, |list, s| ran = s.dispatch(list, x, y, z));
+        super::compute_result(this, ran);
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1131,6 +1133,18 @@ mod state {
 }
 
 /// Without a host GPU every draw state call is ignored.
+
+fn compute_result(this: This, ran: bool) {
+    #[cfg(feature = "diagnostics")]
+    crate::validation::compute(ran);
+    if !ran {
+        static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dropped = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if dropped.is_power_of_two() {
+            tracing::warn!(?this, dropped, "compute dispatch discarded; dependent GPU output may be incomplete");
+        }
+    }
+}
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1181,6 +1195,9 @@ extern "win64" fn execute_indirect(
             address.is_some(),
             count.is_null() || counter.is_some()
         ));
+    }
+    if matches!(args, [[2 | 105, ..]]) {
+        compute_result(this, ran);
     }
     if ran {
         return;
