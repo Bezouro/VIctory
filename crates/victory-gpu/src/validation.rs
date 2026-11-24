@@ -57,12 +57,14 @@ pub(crate) struct Draws {
     count: u32,
     pages: Vec<Option<Storage>>,
     captures: Vec<crate::capture::PassImage>,
+    selected: Vec<(u32, &'static str, u64)>,
 }
 
 impl Draws {
     pub(crate) fn reset(&mut self) {
         self.count = 0;
         self.captures.clear();
+        self.selected.clear();
     }
 
     pub(crate) fn begin(list: &HostList) -> Option<u32> {
@@ -89,6 +91,7 @@ impl Draws {
             unsafe { list.list.EndQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, index % PAGE) };
         }
         if let Some((hash, occurrence)) = capture_occurrence(pipeline) {
+            if let Some(index) = query { d.selected.push((index, hash, occurrence)); }
             tracing::info!(hash, occurrence, frame = crate::queue::presented() + 1, ?view_formats, pipeline = %crate::pipeline::stage_names(pipeline), "matching comparison pass");
             for (slot, &target) in targets.iter().enumerate() {
                 if let Some(image) = crate::capture::PassImage::record(list, target, hash, occurrence, slot) {
@@ -117,6 +120,14 @@ impl Draws {
             unsafe {
                 if back.Map(0, None, Some(&mut data)).is_err() { continue; }
                 let stats = std::slice::from_raw_parts(data.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>(), n as usize);
+                let first = page as u32 * PAGE;
+                for &(index, hash, occurrence) in &self.selected {
+                    if (first..first + n).contains(&index) {
+                        let s = &stats[(index - first) as usize];
+                        tracing::info!(hash, occurrence, clipped_primitives = s.CPrimitives,
+                            pixel_invocations = s.PSInvocations, "completed comparison pass");
+                    }
+                }
                 let mut active = 0;
                 let mut shaded = 0;
                 for s in stats {
