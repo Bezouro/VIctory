@@ -1,5 +1,7 @@
 # VIctory
 
+The `linux-vulkan` branch integrates [the native Linux port](https://github.com/Marvisak/VIctory/pull/526). It runs the title in an x86-64 Linux process. Native vkd3d-proton translates graphics to Vulkan. For the build and read-only launcher, see [Running on Linux](docs/linux.md#running-with-a-read-only-game-directory).
+
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 

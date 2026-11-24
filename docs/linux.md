@@ -169,3 +169,24 @@ to a window.
 | xmem, virtual drives (`files`), persistent local storage | done: xmem on the region table (reservations inside the console's address limits, the physical pool, `alias` for the GPU's page mappings, `MEM_DECOMMIT` to unmap; no placeholders of ours, while the title's own take pages); `G:`/`T:`/storage drives rewritten to Linux folders, names found whatever their case; the title's own `msvcp140` reaches them through its imports |
 | `victory-hle` modules lifecycle, xsystem, apu, dstorage | done: suspend on SIGINT/SIGTERM/SIGHUP (the window's owner raises SIGTERM when the user closes it), relaunch waits on a pidfd, the device type over the empty registry; dstorage reads through the Linux file layer and writes into physical pages |
 | `net`, `media` | Windows only: on Linux `ws2_32`, `winhttp` and `mfplat` keep the same offline policy themselves |
+
+## Running with a read-only game directory
+
+Build the native vkd3d-proton libraries as described above and set
+`VICTORY_VKD3D` to the directory containing both shared libraries. Install
+SDL3, a Vulkan driver for the GPU and bubblewrap. From the repository root:
+
+```sh
+cargo build --release --locked -p victory
+scripts/run-linux.sh /path/to/title.exe --bind-only
+scripts/run-linux.sh /path/to/title.exe
+```
+
+The first command after the build checks whether the loader can map the
+executable and bind imports. The second starts the title. The launcher mounts
+the game directory read-only for the lifetime of the process. Cache files
+go under `$XDG_CACHE_HOME/victory/cache` and saves under
+`$XDG_DATA_HOME/victory`, defaulting to `~/.cache` and `~/.local/share`
+as their respective base directories. Override these locations with
+`VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR`. GPU and display access use the
+current desktop session.
