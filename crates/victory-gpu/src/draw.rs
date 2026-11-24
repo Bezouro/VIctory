@@ -465,6 +465,24 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        if compute && crate::pipeline::trace_compute(&p.name) {
+            let mut bindings = Vec::new();
+            for stage in &p.stages {
+                for u in &stage.translated().used {
+                    let Some(Root::Table(base)) = self.compute.get(usize::from(u.slot)) else { continue };
+                    if u.root != RootType::Table { continue; }
+                    let handle = base + u64::from(u.table_offset_dwords) * 4;
+                    let view = crate::descriptor::view(handle);
+                    let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
+                    bindings.push(format!("{:?}{} slot{}+{} {range:#x?}", u.kind, u.lower_bound, u.slot, u.table_offset_dwords));
+                }
+            }
+            let constants: Vec<_> = self.compute.iter().enumerate().filter_map(|(slot, r)| {
+                if let Root::Constants(c) = r { Some((slot, c)) } else { None }
+            }).collect();
+            tracing::info!(frame = crate::queue::presented() + 1, pipeline = %p.name, ?constants, ?bindings, "compute bindings at recording");
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -510,6 +528,7 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            self.refresh_indexed_reads(list, &t.host.indexed_reads, compute, &p.name);
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
             if self.table_failed {
@@ -678,8 +697,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        let query = crate::capture::MeshStats::begin_compute(list, &p.name, Some([x, y, z]));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        crate::capture::MeshStats::end(list, query);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -730,8 +753,13 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    let query = crate::capture::MeshStats::begin(list, self.pipeline as This,
+                        crate::capture::MeshCommand::Direct { groups: x }, &self.targets);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    crate::capture::MeshStats::end(list, query);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -749,6 +777,35 @@ impl State {
             &self.compute
         } else {
             &self.graphics
+        }
+    }
+
+    /// Scalar and vector buffer loads can index the bound view heap using
+    /// a root constant, without going through any descriptor table.
+    fn refresh_indexed_reads(&self, list: &HostList, reads: &[victory_shader::resource::IndexedRead],
+        compute: bool, _name: &str) {
+        if reads.is_empty() || self.heaps[0] == 0 { return; }
+        let heap = crate::descriptor::heap(self.heaps[0] as This);
+        let Some(host) = heap.host() else { return };
+        for read in reads {
+            let Some(Root::Constants(words)) = self.roots_ref(compute).get(usize::from(read.slot)) else { continue };
+            let Some(&word) = words.get(read.dword as usize) else { continue };
+            let index = word.wrapping_shl(5).wrapping_add(read.byte_offset) >> 5;
+            let handle = heap.start + u64::from(index) * 32;
+            if heap.index(handle) != Some(index) { continue; }
+            let view = host.indexed_view(index, handle);
+            let buffer = view.as_ref().and_then(crate::descriptor::host::buffer_range);
+            #[cfg(feature = "diagnostics")]
+            if compute && crate::pipeline::trace_compute(_name) {
+                tracing::info!(pipeline = _name, slot = read.slot, dword = read.dword, index, ?buffer,
+                    resident = index < host.count(), "direct heap buffer read");
+            }
+            let Some((address, len)) = buffer else { continue };
+            if index >= host.count() || len == 0 { continue; }
+            if let Some(shadow) = crate::shadow::find(address, len) {
+                shadow.refresh(list, address, len);
+                list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
+            }
         }
     }
 
@@ -1161,8 +1218,13 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        #[cfg(feature = "diagnostics")]
+        let sample = if kind == MESH && max > 0 && stride >= 12 {
+            crate::capture::MeshStats::args_before(list, self.pipeline as This, &args.buffer, args.offset(arguments))
+        } else { None };
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max),
+            counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at)))) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -1181,6 +1243,18 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        #[cfg(feature = "diagnostics")]
+        let query = if kind == MESH {
+            if let Some(index) = sample {
+                crate::capture::MeshStats::args_after(list, index, &args.buffer, args.offset(arguments),
+                    counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))));
+            }
+            crate::capture::MeshStats::begin(list, self.pipeline as This,
+                crate::capture::MeshCommand::Indirect { address: arguments, max, counted: counter.is_some(), sampled: sample.is_some() },
+                &self.targets)
+        } else if kind == DISPATCH {
+            crate::capture::MeshStats::begin_compute(list, &p.name, None)
+        } else { None };
         crate::indirect::execute(
             list,
             &signature,
@@ -1188,6 +1262,8 @@ impl State {
             (&args.buffer, args.offset(arguments)),
             counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
         );
+        #[cfg(feature = "diagnostics")]
+        crate::capture::MeshStats::end(list, query);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

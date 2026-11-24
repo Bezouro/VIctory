@@ -696,6 +696,8 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    #[cfg(feature = "diagnostics")]
+    pub(crate) mesh_stats: OnceLock<Option<crate::capture::MeshStats>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1043,6 +1045,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                mesh_stats: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -1153,6 +1157,12 @@ impl Host {
                 self.removal_data(runs),
                 last_notes(runs)
             ));
+        }
+        #[cfg(feature = "diagnostics")]
+        if unsafe { self.fence.GetCompletedValue() } >= *submitted {
+            for list in runs {
+                if let Some(Some(stats)) = list.mesh_stats.get() { stats.report(); }
+            }
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
@@ -1362,6 +1372,46 @@ impl Host {
     }
 }
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn query_storage(ty: D3D12_QUERY_HEAP_TYPE, count: u32, element_bytes: u64)
+    -> Option<(ID3D12QueryHeap, ID3D12Resource)>
+{
+    let device = &host()?.device;
+    let mut heap: Option<ID3D12QueryHeap> = None;
+    let mut back: Option<ID3D12Resource> = None;
+    let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: u64::from(count) * element_bytes,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    // SAFETY: plain object creation.
+    unsafe {
+        device
+            .CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC { Type: ty, Count: count, NodeMask: 0 },
+                &mut heap,
+            )
+            .ok()?;
+        device
+            .CreateCommittedResource(
+                &readback,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut back,
+            )
+            .ok()?;
+    }
+    Some((heap?, back?))
+}
+
 impl HostList {
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
@@ -1371,40 +1421,7 @@ impl HostList {
         }
         self.stamps
             .get_or_init(|| {
-                let device = &host()?.device;
-                let mut heap: Option<ID3D12QueryHeap> = None;
-                let mut back: Option<ID3D12Resource> = None;
-                let readback = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
-                let desc = D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: u64::from(STAMPS) * 8,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                };
-                // SAFETY: plain object creation.
-                unsafe {
-                    device
-                        .CreateQueryHeap(
-                            &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: STAMPS, NodeMask: 0 },
-                            &mut heap,
-                        )
-                        .ok()?;
-                    device
-                        .CreateCommittedResource(
-                            &readback,
-                            D3D12_HEAP_FLAG_NONE,
-                            &desc,
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                            None,
-                            &mut back,
-                        )
-                        .ok()?;
-                }
-                Some((heap?, back?))
+                query_storage(D3D12_QUERY_HEAP_TYPE_TIMESTAMP, STAMPS, 8)
             })
             .as_ref()
     }
@@ -1490,6 +1507,8 @@ impl HostList {
                 self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        if let Some(Some(stats)) = self.mesh_stats.get() { stats.resolve(&self.list); }
         // The buffers it used back to common, where the next list's prelude
         // expects them.
         let back: Vec<D3D12_RESOURCE_BARRIER> = self
@@ -1521,6 +1540,8 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        #[cfg(feature = "diagnostics")]
+        if let Some(Some(stats)) = self.mesh_stats.get() { stats.reset(); }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.buffers.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();

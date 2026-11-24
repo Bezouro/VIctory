@@ -116,7 +116,17 @@ pub struct Resources {
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// Read-only buffers selected directly from the resource heap by a
+    /// root constant. The host must populate these slots before the draw.
+    pub indexed_reads: Vec<IndexedRead>,
     pub waterfall: Waterfall,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexedRead {
+    pub slot: u8,
+    pub dword: u32,
+    pub byte_offset: u32,
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -213,6 +223,25 @@ pub fn track(
                 let (accesses, reads) = first_lane_at.entry(b).or_default();
                 accesses.push(i);
                 reads.extend(first_lane);
+            }
+        }
+    }
+    if layout.iter().any(|p| p.root == RootType::ResourceHeap) {
+        let loads: std::collections::BTreeMap<_, _> = out.scalar.iter().copied().collect();
+        for d in &out.descriptors {
+            let name = t.inst(d.site).name();
+            if !["s_buffer_load", "buffer_load", "tbuffer_load"].iter().any(|prefix| name.starts_with(prefix)) {
+                continue;
+            }
+            for source in d.source.leaves() {
+                let Source::Loaded { load, first } = source else { continue };
+                let Some(addr) = loads.get(load) else { continue };
+                if layout.get(addr.param).is_some_and(|p| p.root == RootType::ResourceHeap)
+                    && let Some(offset) = addr.dynamic
+                {
+                    let bytes = addr.offset.wrapping_add(4 * u32::from(*first));
+                    t.trace_heap_indices(offset, bytes, &mut out.indexed_reads);
+                }
             }
         }
     }
@@ -417,6 +446,33 @@ impl<'a> Tracer<'a> {
             let dword = u32::from(code).checked_sub(first.into())?;
             (dword < p.sgprs).then_some((i, dword))
         })
+    }
+
+    /// A resource-heap byte offset can select either of two descriptors
+    /// across a branch, before or after multiplying the index by 32.
+    fn trace_heap_indices(&self, offset: Value, byte_offset: u32, reads: &mut Vec<IndexedRead>) {
+        let mut pending = vec![(offset, false)];
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some((value, scaled)) = pending.pop() {
+            let Term::Value(v) = self.origin(value) else { continue };
+            if !visited.insert((v, scaled)) {
+                continue;
+            }
+            if let Some((block, phi)) = self.phis[v.0 as usize] {
+                pending.extend(self.p.blocks[block].phis[phi].args.iter().map(|&arg| (arg, scaled)));
+            } else if scaled {
+                if let Some((param, dword)) = self.inputs[v.0 as usize].and_then(|reg| self.param_of(reg))
+                    && self.layout[param].root == RootType::Constants
+                {
+                    let read = IndexedRead { slot: self.layout[param].slot, dword, byte_offset };
+                    if !reads.contains(&read) {
+                        reads.push(read);
+                    }
+                }
+            } else if let Some((_, [Term::Value(index), Term::Const(5)])) = self.sop2(v, &["s_lshl_b32"]) {
+                pending.push((index, true));
+            }
+        }
     }
 
     /// The SOP2 operands of `v` if an `s_add` with one of `names` wrote it.
@@ -1821,6 +1877,7 @@ pub(crate) mod tests {
         );
         let index = r.params.iter().find(|p| p.1 == 0).unwrap().0;
         let shift = r.scalar[0].1.dynamic.unwrap();
+        assert_eq!(r.indexed_reads, [IndexedRead { slot: 0, dword: 0, byte_offset: 0 }]);
         assert_eq!(r.scalar[0].1.param, 1);
         // The computed term is the shifted constant, not the constant itself.
         assert_ne!(shift, index);
@@ -1831,6 +1888,28 @@ pub(crate) mod tests {
                 first: 0
             }
         );
+    }
+
+    #[test]
+    fn heap_indices_on_either_edge_of_a_branch_are_prepared() {
+        let r = track_words(
+            &[
+                0xBF06_8001, // s_cmp_eq_u32 s1, 0
+                0xBF85_0002, // s_cbranch_scc1 to the second shift
+                0x8F08_850E, // s_lshl_b32 s8, s14, 5
+                0xBF82_0001, // s_branch to the join
+                0x8F08_850F, // s_lshl_b32 s8, s15, 5
+                0xBE93_0380, // s_mov_b32 s19, 0
+                0xF408_0209, 0x1000_0000, // s_load_dwordx4 s[8:11], s[18:19], s8
+                0xE000_2000, 0x8002_0400, // buffer_load_format_x through s[8:11]
+                S_ENDPGM,
+            ],
+            &[param(Constants, 6, 2), param(ResourceHeap, 10, 1)],
+            HwStage::Ms,
+        );
+        let mut words: Vec<_> = r.indexed_reads.iter().map(|read| read.dword).collect();
+        words.sort_unstable();
+        assert_eq!(words, [0, 1]);
     }
 
     #[test]

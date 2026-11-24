@@ -178,6 +178,160 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend(crc.to_be_bytes());
 }
 
+/// Clip input, clip output and pixel shader invocations of selected mesh
+/// draws. The host can expose these even without mesh-specific statistics.
+pub(crate) struct MeshStats {
+    heap: ID3D12QueryHeap,
+    back: ID3D12Resource,
+    labels: std::sync::Mutex<Vec<(String, MeshCommand)>>,
+}
+
+#[derive(Debug)]
+pub(crate) enum MeshCommand {
+    Compute { groups: Option<[u32; 3]> },
+    Direct { groups: u32 },
+    Indirect { address: u64, max: u32, counted: bool, sampled: bool },
+}
+
+impl MeshStats {
+    const LIMIT: u32 = 32;
+
+    const STATS_BYTES: u64 = size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>() as u64;
+    const ARG_BYTES: u64 = 32;
+
+    fn storage(list: &crate::host::HostList) -> Option<&Self> {
+        list.mesh_stats.get_or_init(|| {
+            let (heap, back) = crate::host::query_storage(
+                D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, Self::LIMIT,
+                Self::STATS_BYTES + Self::ARG_BYTES,
+            )?;
+            Some(Self { heap, back, labels: Default::default() })
+        }).as_ref()
+    }
+
+    fn arg_offset(index: u32) -> u64 {
+        u64::from(Self::LIMIT) * Self::STATS_BYTES + u64::from(index) * Self::ARG_BYTES
+    }
+
+    /// Record the first indirect argument on either side of the host clamp.
+    /// The list records one draw at a time. If binding fails, no query is
+    /// issued and the next draw can overwrite this unused slot.
+    pub(crate) fn args_before(list: &crate::host::HostList, pipeline: crate::object::This,
+        args: &ID3D12Resource, offset: u64) -> Option<u32> {
+        crate::pipeline::measured_mesh(pipeline)?;
+        let stats = Self::storage(list)?;
+        let index = stats.labels.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        if index >= Self::LIMIT { return None; }
+        list.buffer_state(args, crate::host::BUFFER_READ);
+        // SAFETY: the signature covers a full three-dword mesh record.
+        unsafe { list.list.CopyBufferRegion(&stats.back, Self::arg_offset(index), args, offset, 12) };
+        Some(index)
+    }
+
+    pub(crate) fn args_after(list: &crate::host::HostList, index: u32,
+        args: &ID3D12Resource, offset: u64, count: Option<(&ID3D12Resource, u64)>) {
+        let stats = list.mesh_stats.get().and_then(Option::as_ref).expect("reserved mesh sample");
+        let at = Self::arg_offset(index);
+        list.buffer_state(args, crate::host::BUFFER_READ);
+        // SAFETY: a matching reservation and the live record held by the list.
+        unsafe { list.list.CopyBufferRegion(&stats.back, at + 12, args, offset, 12) };
+        if let Some((counter, offset)) = count {
+            list.buffer_state(counter, crate::host::BUFFER_READ);
+            // SAFETY: the optional execution count covers one dword.
+            unsafe { list.list.CopyBufferRegion(&stats.back, at + 24, counter, offset, 4) };
+        }
+    }
+
+    pub(crate) fn begin(list: &crate::host::HostList, pipeline: crate::object::This,
+        command: MeshCommand, targets: &[usize]) -> Option<u32> {
+        let label = crate::pipeline::measured_mesh(pipeline)?;
+        Self::begin_label(list, label, command, targets)
+    }
+
+    pub(crate) fn begin_compute(list: &crate::host::HostList, pipeline: &str, groups: Option<[u32; 3]>) -> Option<u32> {
+        if !crate::pipeline::trace_compute(pipeline) {
+            return None;
+        }
+        Self::begin_label(list, pipeline.to_owned(), MeshCommand::Compute { groups }, &[])
+    }
+
+    fn begin_label(list: &crate::host::HostList, mut label: String, command: MeshCommand, targets: &[usize]) -> Option<u32> {
+        let s = Self::storage(list)?;
+        let mut labels = s.labels.lock().unwrap_or_else(|e| e.into_inner());
+        let index = labels.len() as u32;
+        if index == Self::LIMIT { return None; }
+        for &target in targets {
+            if let Some(t) = crate::resource::host_resource(target as crate::object::This) {
+                use std::fmt::Write;
+                // SAFETY: a render target bound on this command list.
+                let desc = unsafe { t.GetDesc() };
+                let _ = write!(label, " rt={target:#x}/{}x{}/f{}", desc.Width, desc.Height, desc.Format.0);
+            }
+        }
+        labels.push((label, command));
+        // SAFETY: an unused query slot on the open command list.
+        unsafe { list.list.BeginQuery(&s.heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, index) };
+        Some(index)
+    }
+
+    pub(crate) fn end(list: &crate::host::HostList, index: Option<u32>) {
+        if let (Some(index), Some(Some(s))) = (index, list.mesh_stats.get()) {
+            // SAFETY: paired with begin on the same list around a single draw.
+            unsafe { list.list.EndQuery(&s.heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, index) };
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        self.labels.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    pub(crate) fn resolve(&self, list: &ID3D12GraphicsCommandList) {
+        let count = self.labels.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
+        if count != 0 {
+            // SAFETY: each query ended, and the buffer has room for LIMIT.
+            unsafe { list.ResolveQueryData(&self.heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, count, &self.back, 0) };
+        }
+    }
+
+    pub(crate) fn report(&self) {
+        let labels = self.labels.lock().unwrap_or_else(|e| e.into_inner());
+        if labels.is_empty() { return; }
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the submission fence completed. The mapping is large
+        // enough for every resolved entry and remains live while we read.
+        unsafe {
+            if self.back.Map(0, None, Some(&mut data)).is_err() { return; }
+            for (index, ((label, command), stats)) in labels.iter().zip(std::slice::from_raw_parts(
+                data.cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>(), labels.len(),
+            )).enumerate() {
+                match *command {
+                    MeshCommand::Compute { groups } => {
+                        tracing::info!(frame = crate::queue::presented() + 1, pipeline = %label,
+                            ?groups, invocations = stats.CSInvocations, "submitted compute statistics");
+                        continue;
+                    }
+                    MeshCommand::Indirect { address, max, counted, sampled: true } => {
+                        let words = data.cast::<u8>().add(Self::arg_offset(index as u32) as usize).cast::<u32>();
+                        let raw = std::slice::from_raw_parts(words, 3);
+                        let clamped = std::slice::from_raw_parts(words.add(3), 3);
+                        let count = counted.then(|| *words.add(6));
+                        tracing::info!(frame = crate::queue::presented() + 1, pipeline = %label,
+                            address = format_args!("{address:#x}"), max, ?raw, ?clamped, ?count, "mesh first indirect record");
+                    }
+                    MeshCommand::Direct { groups } => {
+                        tracing::info!(frame = crate::queue::presented() + 1, pipeline = %label, groups, "mesh direct dispatch");
+                    }
+                    _ => {}
+                }
+                tracing::info!(frame = crate::queue::presented() + 1, pipeline = %label,
+                    clip_in = stats.CInvocations, clip_out = stats.CPrimitives,
+                    pixel_invocations = stats.PSInvocations, "submitted mesh statistics");
+            }
+            self.back.Unmap(0, None);
+        }
+    }
+}
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in bytes {

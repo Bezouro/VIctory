@@ -451,7 +451,20 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let record = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        self.mirror_record(index, record, for_draw)
+    }
+
+    /// Resolve a direct heap index derived from shader data. An uncommitted
+    /// guest slot reads as an empty record, as on an ordinary upload.
+    pub(crate) fn indexed_view(&self, index: u32, handle: u64) -> Option<View> {
+        if index >= self.count { return None; }
+        let mut record = [0u32; 3];
+        crate::host::copy_mapped(record.as_mut_ptr().cast(), handle as *const u8, size_of_val(&record), false);
+        self.mirror_record(index, record, true)
+    }
+
+    fn mirror_record(&self, index: u32, [tag, i, generation]: [u32; 3], for_draw: bool) -> Option<View> {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());

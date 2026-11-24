@@ -329,6 +329,23 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        #[cfg(feature = "diagnostics")]
+        {
+            static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *DEBUG.get_or_init(|| std::env::var("VICTORY_DEBUG_PS").as_deref() == Ok("1"))
+                && g.is_some_and(|g| g.depth_format != DXGI_FORMAT_UNKNOWN && g.depth.DepthEnable.as_bool() && g.targets.NumRenderTargets != 0)
+                && shaders.iter().any(|s| s.stage == "pixel")
+                && let Some(mut pipeline) = Self::make(shaders, g, true)
+            {
+                pipeline.name.push_str(" [diagnostic slope colour]");
+                tracing::info!(?shaders, "geometry rendered with a diagnostic pixel shader");
+                return Some(pipeline);
+            }
+        }
+        Self::make(shaders, g, false)
+    }
+
+    fn make(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, diagnostic_pixel: bool) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -354,7 +371,9 @@ impl HostPipeline {
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            if !diagnostic_pixel {
+                stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            }
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -474,7 +493,16 @@ impl HostPipeline {
                 return None;
             }
         };
+        let debug = diagnostic_pixel.then(|| {
+            static PIXELS: [std::sync::OnceLock<victory_shader::emit::HostShader>; 8] =
+                [const { std::sync::OnceLock::new() }; 8];
+            let n = g.expect("diagnostic graphics state").targets.NumRenderTargets.clamp(1, 8);
+            PIXELS[n as usize - 1].get_or_init(|| victory_shader::emit::debug_ps(n))
+        });
         let code = |i: usize| {
+            if i == 1 && let Some(ps) = debug {
+                return D3D12_SHADER_BYTECODE { pShaderBytecode: ps.dxil.as_ptr().cast(), BytecodeLength: ps.dxil.len() };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {

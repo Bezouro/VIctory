@@ -196,6 +196,9 @@ directory inside the writable cache on a disk filesystem with `O_TMPFILE`
 and hole-punch support. The guest physical page pool uses an unnamed sparse
 file there. Its views share bytes as usual, and the kernel can write pages
 back under memory pressure. The file is released when the process exits.
+For sparse workloads on that file, `VICTORY_POOL_RANDOM_READS=1` disables
+kernel read-ahead on its guest mappings. Compare storage reads and frame
+times on the same scene to evaluate its effect on the host.
 
 
 In a diagnostics build, `VICTORY_SCENE_EXTENT=1280x720` presents the last
@@ -210,3 +213,29 @@ When investigating a specific draw, set `VICTORY_PREWARM_SHADERS` to its
 comma-separated 16-digit shader hashes from the first-bind log. Previously
 requested pipelines containing them move ahead of other speculative compiles
 during loading. Draws that the current frame already needs retain priority.
+For a focused capture, add `VICTORY_PREWARM_FIRST=1` to compile matching
+pipelines in creation order ahead of that backlog, including on a cold
+cache. Choose a small set such as the pixel shaders of one material.
+
+`VICTORY_MEASURE_MESH` accepts the same hash format. It records up to 32
+matching mesh draws per command list and reports clipping and pixel shader
+invocations after the submission fence completes. For indirect draws it
+reads the first GPU argument record before and after the clamp, together
+with the optional execution count. Zero clip input can occur even with a
+nonzero group count.
+
+In a diagnostics build, `VICTORY_DEBUG_PS=1` colours depth-tested geometry
+by screen-space depth slope. The title still supplies the geometry and
+draws. This view substitutes its own pixel shader for the material and
+falls back to the title's shader if the diagnostic pipeline is refused.
+The slope shader comes from [the upstream rendering experiment](https://github.com/Marvisak/VIctory/pull/994).
+
+On Linux the first dispatch that needs a compute pipeline claims its build
+or waits for the worker already compiling it. This preserves one-shot writes
+such as the inputs to later indirect mesh draws. An explicit
+`VICTORY_PSO_WAIT_MS` uses the shared per-frame budget for compute as well
+as graphics. Cold compute compiles can stall the first frame that uses them.
+
+`VICTORY_TRACE_COMPUTE` takes comma-separated shader hashes. The diagnostics
+log includes root constants, buffer views and the GPU's compute invocation
+count after submission. Mesh and compute queries share 32 entries per list.

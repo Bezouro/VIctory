@@ -187,6 +187,7 @@ fn lower_cs(words: &[u32], root_srv: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        indexed_reads: Vec::new(),
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

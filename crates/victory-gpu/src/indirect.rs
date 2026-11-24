@@ -28,9 +28,10 @@ use windows::core::s;
 use crate::host::{BUFFER_READ, BUFFER_WRITE, HostList, host};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
 RWByteAddressBuffer args : register(u0);
+RWByteAddressBuffer executionCount : register(u2);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
@@ -41,6 +42,11 @@ static const uint GROUPS = 1u << 20;
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= records) return;
+    // ExecuteIndirect ignores records beyond the GPU count. They remain
+    // available to later commands and consume none of this list's budget.
+    [branch] if (counted != 0) {
+        if (id.x >= executionCount.Load(0)) return;
+    }
     uint at = id.x * stride;
     uint cost;
     if (kind <= 1) {
@@ -179,16 +185,21 @@ pub(crate) fn bound(
     buffer: &ID3D12Resource,
     gpu: u64,
     (kind, stride, records): (u32, u32, u32),
+    counter: Option<(&ID3D12Resource, u64)>,
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
     };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
+    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4)
+        || counter.is_some_and(|(_, va)| !va.is_multiple_of(4)) {
         return false;
     }
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
+    let constants = [kind, stride, records, u32::from(counter.is_some())];
     list.buffer_state(buffer, BUFFER_WRITE);
+    if let Some((c, _)) = counter {
+        list.buffer_state(c, BUFFER_WRITE);
+    }
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
     unsafe {
@@ -199,6 +210,7 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, counter.map_or(budget, |(_, va)| va));
         l.Dispatch(records.div_ceil(64), 1, 1);
         l.ResourceBarrier(&[uav_barrier()]);
     }
@@ -246,6 +258,35 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gpu_count_limits_mesh_argument_clamping() {
+        let Some(host) = super::host() else { return };
+        if cfg!(not(windows)) && std::env::var_os("VICTORY_DXCOMPILER").is_none() { return; }
+        let (buffer, data) = host.shared_buffer(256).unwrap();
+        // The count and both argument records are in the same resource.
+        let initial = [90000u32, 9, 8, 80000, 7, 6];
+        for (count, expected) in [
+            (Some(0u32), initial),
+            (Some(1), [65535, 1, 1, 80000, 7, 6]),
+            (Some(3), [65535, 1, 1, 65535, 1, 1]),
+            (None, [65535, 1, 1, 65535, 1, 1]),
+        ] {
+            let list = host.new_list().unwrap();
+            // SAFETY: a mapped shared buffer with room for the two
+            // records and a disjoint count. Previous work has finished.
+            let gpu = unsafe {
+                std::ptr::copy_nonoverlapping(initial.as_ptr(), data.cast::<u32>(), initial.len());
+                data.add(64).cast::<u32>().write(count.unwrap_or(0));
+                buffer.GetGPUVirtualAddress()
+            };
+            assert!(super::bound(&list, &buffer, gpu, (10, 12, 2), count.map(|_| (&buffer, gpu + 64))));
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: execute waited for the fence and these six words are mapped.
+            assert_eq!(unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 6) }, expected);
+        }
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {

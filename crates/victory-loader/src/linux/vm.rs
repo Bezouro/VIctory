@@ -127,6 +127,7 @@ pub struct MemoryBasicInformation {
 pub struct Section {
     fd: OwnedFd,
     size: AtomicU64,
+    random_reads: bool,
 }
 
 impl Section {
@@ -142,6 +143,7 @@ impl Section {
         let section = Section {
             fd,
             size: AtomicU64::new(0),
+            random_reads: false,
         };
         section.resize(size)?;
         Ok(Arc::new(section))
@@ -167,6 +169,7 @@ impl Section {
         Ok(Arc::new(Section {
             fd: file.into(),
             size: AtomicU64::new(0),
+            random_reads: std::env::var("VICTORY_POOL_RANDOM_READS").as_deref() == Ok("1"),
         }))
     }
 
@@ -1362,6 +1365,12 @@ pub fn phys_map(va: usize, pages: &[u64], protect: u32) -> Result<(), u32> {
         };
         if p == libc::MAP_FAILED {
             break;
+        }
+        if pool.random_reads {
+            // Sparse references under memory pressure can repeatedly fault
+            // neighboring file pages back in before the title needs them.
+            // SAFETY: exactly the range just mapped. Advice is best effort.
+            unsafe { libc::madvise(p, k * PHYS_PAGE, libc::MADV_RANDOM) };
         }
         each(runs, at, at + k * PHYS_PAGE, |s, r| {
             r.committed = true;

@@ -208,6 +208,26 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// Select compute pipelines whose root arguments are traced at recording.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_compute(name: &str) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| parse_shader_hashes(&std::env::var("VICTORY_TRACE_COMPUTE").unwrap_or_default()))
+        .iter().any(|hash| name.contains(hash))
+}
+
+/// Label for an opt-in measurement of a mesh draw after its pipeline is bound.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn measured_mesh(this: This) -> Option<String> {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        parse_shader_hashes(&std::env::var("VICTORY_MEASURE_MESH").unwrap_or_default())
+    });
+    if hashes.is_empty() || this.is_null() { return None; }
+    let stages = &pipeline(this).shaders;
+    stages.iter().any(|s| hashes.contains(&s.hash)).then(|| format!("{stages:?}"))
+}
+
 /// Host pipelines queued and not made yet.
 pub(crate) fn making() -> u64 {
     make::waiting()

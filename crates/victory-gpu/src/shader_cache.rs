@@ -221,6 +221,10 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.indexed_reads.len() as u32);
+    for r in &s.indexed_reads {
+        for value in [u32::from(r.slot), r.dword, r.byte_offset] { word(&mut out, value); }
+    }
     out
 }
 
@@ -277,6 +281,13 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let count = r.word()? as usize;
+    let mut indexed_reads = Vec::with_capacity(count.min(256));
+    for _ in 0..count {
+        indexed_reads.push(victory_shader::resource::IndexedRead {
+            slot: r.word()?.try_into().ok()?, dword: r.word()?, byte_offset: r.word()?,
+        });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -285,6 +296,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        indexed_reads,
     })
 }
 
@@ -311,6 +323,7 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
+            indexed_reads: vec![victory_shader::resource::IndexedRead { slot: 1, dword: 2, byte_offset: 32 }],
         }
     }
 

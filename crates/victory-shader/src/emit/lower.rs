@@ -2615,13 +2615,21 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// Console lane number derived from the logical mesh workgroup thread.
+    fn mesh_lane_index(&mut self) -> V {
+        let thread = self.mesh_thread();
+        let mask = self.s.m.i32(self.wave() - 1);
+        self.s.m.bin(self.s.entry, Bin::And, thread, mask)
+    }
+
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
-            // The console's lane: mesh code reads no other lanes, so host
-            // waves need not match the console's.
-            let f = self.mesh_thread();
-            let m = self.s.m.i32(self.wave() - 1);
-            return self.s.m.bin(self.s.entry, Bin::And, f, m);
+            if !self.x.native.wave64 || self.x.target.lanes_max != 32 {
+                return self.mesh_lane_index();
+            }
+            // Ballots and waveReadLaneAt use physical host lanes. In the
+            // second half, a logical mesh lane 32..63 would select no bit.
+            self.s.flags |= flags::WAVE_OPS;
         }
         self.s.op(
             self.cur,
@@ -6235,6 +6243,12 @@ impl<'a> Lower<'a> {
                 }
                 let lane = if self.console_cf {
                     self.console_lane().0
+                } else if self.s.mesh.is_some()
+                    && matches!(&inst.fields, Fields::Valu(v) if v.src.first() == Some(&Operand::Const(193)))
+                {
+                    // Counting a literal mask of all ones computes a logical
+                    // console thread index, independent of a physical ballot.
+                    self.mesh_lane_index()
                 } else {
                     self.lane_index()
                 };

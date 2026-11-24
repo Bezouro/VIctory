@@ -1,5 +1,5 @@
-//! Host pipelines are made by workers, not by the title thread that first
-//! records a draw with them. Translating a shader and the host driver's
+//! Graphics pipelines are made by workers. On Linux a compute dispatch can
+//! claim its own compilation when no worker has finished it. Translating a shader and the host driver's
 //! compile take from milliseconds to seconds each, and a title's first world
 //! frame can request over 1,200 new pipelines: making them synchronously on
 //! recording threads stalls the frame for tens of seconds and can trigger a
@@ -18,7 +18,9 @@
 //! compile reliably, then [`STEADY_BUDGET_MS`] (8 ms) once presenting steadily
 //! so live gameplay avoids large compile hitches. Setting
 //! `VICTORY_PSO_WAIT_MS` (`0..=5000`) overrides the per-frame budget for every
-//! frame (`0` disables synchronous waiting completely).
+//! frame (`0` disables synchronous waiting completely). Without an explicit
+//! wait budget, Linux resolves compute pipelines at first dispatch so later
+//! draws see the data that dispatch produces.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -270,17 +272,43 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // A missed first draw still identifies a pipeline the next run needs early.
-    if !p.used.swap(true, Ordering::Relaxed) {
+    let first = !p.used.swap(true, Ordering::Relaxed);
+    if first {
         super::library::note_used(&p.key);
-        if p.made.get().is_none() {
-            WORK.lock().unwrap_or_else(|e| e.into_inner()).promote(p);
-        }
     }
     if p.made.get().is_none() {
-        start(p);
-        wait(p, crate::frame::current());
+        if cfg!(target_os = "linux") && configured_wait_ms().is_none()
+            && matches!(p.shaders.as_slice(), [cs] if cs.stage == "compute")
+        {
+            // The GPU might consume this dispatch's results only once. An
+            // exhausted graphics frame budget cannot safely discard it.
+            resolve_compute(p);
+        } else {
+            if first {
+                WORK.lock().unwrap_or_else(|e| e.into_inner()).promote(p);
+            }
+            start(p);
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Claim an unstarted job from any priority queue. OnceLock in Pending::make
+/// joins a compilation already owned by another recording thread or worker.
+fn resolve_compute(p: &Arc<Pending>) {
+    let started = Instant::now();
+    let queued = p.queued.swap(true, Ordering::AcqRel)
+        && WORK.lock().unwrap_or_else(|e| e.into_inner()).take(p);
+    if queued {
+        finish(p);
+    } else {
+        p.make();
+    }
+    #[cfg(feature = "diagnostics")]
+    tracing::debug!(hash = %p.shaders[0].hash, queued, wait_us = started.elapsed().as_micros(),
+        ready = p.made.get().is_some_and(Option::is_some), "resolved compute on demand");
+    let _ = started;
 }
 
 /// Queues `p` for the workers, once.
@@ -297,7 +325,7 @@ fn start(p: &Arc<Pending>) {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if !p.shaders.is_empty() && (focus(p) || super::library::wanted_early(&p.key)) {
         #[cfg(feature = "diagnostics")]
         if super::skipped_shader(&p.shaders).is_some() {
             return;
@@ -337,17 +365,20 @@ fn wait(p: &Pending, frame: u64) {
 /// Keep the first-use order of draws within a frame while letting them
 /// overtake a speculative backlog from an earlier launch.
 struct Work {
+    focus: VecDeque<Arc<Pending>>,
     needed: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
 }
 
 impl Work {
     const fn new() -> Self {
-        Self { needed: VecDeque::new(), early: VecDeque::new() }
+        Self { focus: VecDeque::new(), needed: VecDeque::new(), early: VecDeque::new() }
     }
 
-    fn push(&mut self, p: Arc<Pending>) {
-        if p.used.load(Ordering::Relaxed) {
+    fn push(&mut self, p: Arc<Pending>, focused: bool) {
+        if focused {
+            self.focus.push_back(p);
+        } else if p.used.load(Ordering::Relaxed) {
             self.needed.push_back(p);
         } else {
             #[cfg(feature = "diagnostics")]
@@ -365,9 +396,33 @@ impl Work {
         }
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        self.needed.pop_front().or_else(|| self.early.pop_front())
+    /// Remove a job claimed by the command that needs its output.
+    fn take(&mut self, pipeline: &Arc<Pending>) -> bool {
+        for queue in [&mut self.focus, &mut self.needed, &mut self.early] {
+            if let Some(at) = queue.iter().position(|p| Arc::ptr_eq(p, pipeline)) {
+                queue.remove(at);
+                return true;
+            }
+        }
+        false
     }
+
+    fn pop(&mut self) -> Option<Arc<Pending>> {
+        self.focus.pop_front().or_else(|| self.needed.pop_front()).or_else(|| self.early.pop_front())
+    }
+}
+
+/// In a focused capture, compile selected shaders as soon as the title
+/// creates their pipelines. A queue of unrelated, already bound pipelines
+/// can otherwise outlive the entire scene being investigated.
+fn focus(p: &Pending) -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("VICTORY_PREWARM_FIRST").as_deref() == Ok("1")) && preferred(p)
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    { let _ = p; false }
 }
 
 /// Specific shaders under investigation can be warmed during title loading.
@@ -436,7 +491,8 @@ fn queue(p: Arc<Pending>) {
         running
     });
     if *running {
-        WORK.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+        let focused = focus(&p);
+        WORK.lock().unwrap_or_else(|e| e.into_inner()).push(p, focused);
         AVAILABLE.notify_one();
     } else {
         finish(&p);
@@ -471,13 +527,42 @@ mod tests {
         let (a, b, c) = (job(), job(), job());
         let mut work = Work::new();
         for p in [&a, &b, &c] {
-            work.push(p.clone());
+            work.push(p.clone(), false);
         }
         work.promote(&c);
         work.promote(&b);
         work.promote(&c);
         for p in [&c, &b, &a] {
             assert!(Arc::ptr_eq(&work.pop().unwrap(), p));
+        }
+        assert!(work.pop().is_none());
+    }
+
+    #[test]
+    fn focused_pipelines_keep_creation_order_ahead_of_the_draw_backlog() {
+        let job = || Arc::new(Pending::new(Vec::new(), None));
+        let (needed, first, second) = (job(), job(), job());
+        let mut work = Work::new();
+        work.push(needed.clone(), false);
+        work.promote(&needed);
+        work.push(first.clone(), true);
+        work.push(second.clone(), true);
+        work.promote(&second);
+        for p in [&first, &second, &needed] {
+            assert!(Arc::ptr_eq(&work.pop().unwrap(), p));
+        }
+        assert!(work.pop().is_none());
+    }
+
+    #[test]
+    fn compute_claims_preloaded_and_demanded_jobs_exactly_once() {
+        let mut work = Work::new();
+        for kind in 0..3 {
+            let p = Arc::new(Pending::new(Vec::new(), None));
+            p.used.store(kind == 1, Ordering::Relaxed);
+            work.push(p.clone(), kind == 2);
+            assert!(work.take(&p));
+            assert!(!work.take(&p));
         }
         assert!(work.pop().is_none());
     }
