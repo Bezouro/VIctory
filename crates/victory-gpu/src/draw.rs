@@ -820,6 +820,31 @@ impl State {
         crate::producers::Journal::before(list, shader, range, address)
     }
 
+    #[cfg(feature = "diagnostics")]
+    fn sample_pack_input(&self, list: &HostList, p: &HostPipeline, groups: [u32; 3]) {
+        let Some(x) = crate::producers::word() else { return };
+        // This layout applies to the identified PackInstances kernel only.
+        if p.name != "[compute c1488f485ad606fb]" || groups[1..] != [1, 1] { return; }
+        let Some(Root::Constants(c)) = self.compute.get(1) else { return };
+        let [items, stride, ..] = c.as_slice() else { return };
+        if *stride == 0 { return; }
+        let range = |kind, register| {
+            let u = p.stages.first()?.translated().used.iter().find(|u|
+                u.root == RootType::Table && u.kind == kind && u.lower_bound == register)?;
+            let Root::Table(table) = self.compute.get(usize::from(u.slot))? else { return None };
+            let handle = table.checked_add(u64::from(u.table_offset_dwords) * 4)?;
+            crate::descriptor::host::buffer_range(&crate::descriptor::view(handle)?)
+        };
+        let Some((base, size)) = range(ResourceType::Uav, 8) else { return };
+        if !crate::producers::covers(base, size, x) { return; }
+        let offset = x - base;
+        if !offset.is_multiple_of(u64::from(*stride)) { return; }
+        let Ok(record) = u32::try_from(offset / u64::from(*stride)) else { return };
+        if let Some(source) = range(ResourceType::Srv, 83) {
+            crate::producers::Journal::pack_input(list, source, (*items).min(groups[0].saturating_mul(64)), record);
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> bool {
         #[cfg(feature = "diagnostics")]
@@ -855,6 +880,8 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        #[cfg(feature = "diagnostics")]
+        self.sample_pack_input(list, p, [x, y, z]);
         #[cfg(feature = "diagnostics")]
         let query = crate::capture::MeshStats::begin_compute(list, &p.name, Some([x, y, z]));
         #[cfg(feature = "diagnostics")]

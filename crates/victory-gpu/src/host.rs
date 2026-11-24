@@ -1666,6 +1666,13 @@ impl HostList {
         }
     }
 
+    /// Current state after binding, so a diagnostic copy can restore it before dispatch.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn bound_buffer_state(&self, buffer: &ID3D12Resource) -> Option<u32> {
+        let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        buffers.by_copy.get(&(buffer.as_raw() as usize)).map(|(_, last, _)| *last)
+    }
+
     /// [`HostList::track`], with the barrier to record if it is a change.
     fn move_to(&self, copy: &HostCopy, wanted: u32) -> Option<D3D12_RESOURCE_BARRIER> {
         let before = self.track(copy, wanted)?;

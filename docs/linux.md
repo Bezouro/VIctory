@@ -291,3 +291,9 @@ For a mesh draw whose guest addresses vary by run, set
 `VICTORY_PRODUCER_MESH` to one mesh shader hash. The first matching indirect
 draw selects the address of its first X argument for later compute samples
 and consumer reads. An explicit `VICTORY_PRODUCER_X` selects a fixed address.
+
+For a matching direct PackInstances dispatch, the indirect probe also copies
+the active source indices from SRV 83 before dispatch and counts references
+to the selected UAV 8 record after its fence completes. This measurement
+requires a valid stride, a tracked source buffer, a one-dimensional dispatch
+and at most 16,384 active inputs. An unavailable readback has no hit count.
