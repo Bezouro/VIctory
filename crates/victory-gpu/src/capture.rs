@@ -331,10 +331,34 @@ fn presentable(c: &crate::resource::HostTexture) -> bool {
     d.MipLevels == 1 && d.DepthOrArraySize == 1
 }
 
+/// Optional internal scene submitted as the first presentation plane. Keep
+/// the latest matching bind, because the order of targets varies between frames.
+static SCENE: std::sync::Mutex<Option<std::sync::Arc<crate::resource::HostTexture>>> =
+    std::sync::Mutex::new(None);
+
+fn scene_extent() -> Option<(u64, u32)> {
+    static SIZE: std::sync::OnceLock<Option<(u64, u32)>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let value = std::env::var("VICTORY_SCENE_EXTENT").ok()?;
+        let (w, h) = value.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?))
+    })
+}
+
+pub(crate) fn take_scene() -> Option<std::sync::Arc<crate::resource::HostTexture>> {
+    scene_extent()?;
+    SCENE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
     if resource.is_null() {
         return;
+    }
+    if let Some((width, height)) = scene_extent()
+        && let Some(copy) = crate::resource::scene_surface(resource, width, height)
+    {
+        *SCENE.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
     }
     let dumping = dump_on() && listed(crate::queue::presented() + 1);
     if !dumping && show_index().is_none() {

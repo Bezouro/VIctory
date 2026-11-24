@@ -1053,6 +1053,25 @@ pub(crate) fn host_resource<'a>(
     resource(this).host_copy().map(|h| &h.texture)
 }
 
+/// A single-sample RGBA/BGRA scene surface at the requested internal resolution.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn scene_surface(
+    this: This,
+    width: u64,
+    height: u32,
+) -> Option<std::sync::Arc<HostTexture>> {
+    let r = resource(this);
+    let d = &r.desc;
+    if d.dimension != 3 || d.width != width || d.height != height
+        || d.mip_levels != 1 || d.depth_or_array_size != 1 || d.sample_count != 1 {
+        return None;
+    }
+    let copy = r.host_copy()?;
+    // SAFETY: the Arc owns the texture and its description is immutable.
+    let format = unsafe { copy.texture.GetDesc() }.Format.0;
+    matches!(format, 28 | 29 | 87 | 91).then(|| copy.clone())
+}
+
 /// The host texture unordered access views of a title texture name: the
 /// twin of a depth target that has one, with the format such a view takes
 /// when the title's names none or a depth format; else the host copy.

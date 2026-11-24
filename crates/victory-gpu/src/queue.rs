@@ -253,6 +253,8 @@ extern "win64" fn present(
     _parameters: *const u8,
 ) -> HRESULT {
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(feature = "diagnostics")]
+    let scene = crate::capture::take_scene();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         let (drawn, dispatched) = {
@@ -314,10 +316,30 @@ extern "win64" fn present(
             }
         }
         if !resources.is_empty() {
-            let sources: Vec<(&_, u32)> = resources
+            #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+            let mut sources: Vec<(&_, u32)> = resources
                 .iter()
                 .map(|(_, tex, state)| (*tex, *state))
                 .collect();
+            #[cfg(feature = "diagnostics")]
+            if let Some(ref copy) = scene {
+                // A presented resource may also be the scene target. Its
+                // tracked state was temporarily changed in the plane loop.
+                let state = sources.iter()
+                    .find(|(tex, _)| *tex == &copy.texture)
+                    .map(|(_, state)| *state)
+                    .unwrap_or_else(|| {
+                        crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed))
+                    });
+                sources[0] = (&copy.texture, state);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    // SAFETY: the Arc owns this texture.
+                    let d = unsafe { copy.texture.GetDesc() };
+                    tracing::info!(frame, width = d.Width, height = d.Height, format = d.Format.0,
+                        "presenting the internal scene with the title overlay");
+                });
+            }
             let shown = host.present(&sources, frame);
             for &(resource, _, state) in &resources {
                 crate::resource::host_transition(resource, state);

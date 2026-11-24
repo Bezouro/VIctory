@@ -196,3 +196,12 @@ directory inside the writable cache on a disk filesystem with `O_TMPFILE`
 and hole-punch support. The guest physical page pool uses an unnamed sparse
 file there. Its views share bytes as usual, and the kernel can write pages
 back under memory pressure. The file is released when the process exits.
+
+
+In a diagnostics build, `VICTORY_SCENE_EXTENT=1280x720` presents the last
+single-sample RGBA8 or BGRA8 target of that size as the scene and composites
+the remaining presentation planes over it. For a title rendering internally
+at 2560×1440, use `2560x1440`. Frames with no matching target follow the
+title's normal presentation path. This is a diagnostic view of an internal
+surface and can show unlit geometry. The selection follows the upstream
+community's [1440p presentation experiment](https://github.com/mpDom/VIctory/commit/d6897facd92d6dd7f1a0d5177cf84e3d95a4951b).
