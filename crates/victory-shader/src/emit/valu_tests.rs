@@ -1005,3 +1005,26 @@ fn a_heap_index_past_the_heap_reads_the_guard_slot() {
         assert_eq!(got, want, "{label}: index {:#x}", k[0]);
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn canonical_compute_cfg_preserves_conditional_uav_writes() {
+    if std::env::var_os("VICTORY_DXCOMPILER").is_none() {
+        eprintln!("DXC unavailable");
+        return;
+    }
+    let mut shader = build_valu_cs(&[
+        0xbf06_8000,          // s_cmp_eq_u32 s0, 0
+        0xbf85_0002,          // s_cbranch_scc1 select_second
+        vop1(1, 0, vgpr(1)), // v_mov_b32 v0, v1
+        0xbf82_0001,          // s_branch store
+        vop1(1, 0, vgpr(2)), // select_second: v_mov_b32 v0, v2
+    ]);
+    shader.dxil = validator::canonical::compute(shader.dxil).unwrap();
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil).unwrap();
+    }
+    run_cases(&shader, &[[0, 71, 0, 0], [29, 99, 0, 0]], |_, _, args, result| {
+        assert_eq!(result, if args[0] == 0 { args[1] } else { args[0] });
+    });
+}

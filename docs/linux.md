@@ -137,7 +137,8 @@ vkd3d-proton writes `vkd3d-proton.cache` into the working directory
 
 DXC is optional and opt-in on Linux: `VICTORY_DXIL` names `libdxil.so`
 for `victory translate --validate`, `VICTORY_DXCOMPILER` names
-`libdxcompiler.so` for the indirect argument clamp (without it indirect
+`libdxcompiler.so` for the indirect argument clamp and CFG canonicalization of
+the prop batch compute shader (without it indirect
 execution is dropped, as when the clamp fails on Windows). Arch's
 `directx-shader-compiler` 1.10.2605 asserts on every shader it compiles
 and its validator traps on some of ours, so neither is loaded unasked.

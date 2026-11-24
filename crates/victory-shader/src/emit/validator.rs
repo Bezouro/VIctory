@@ -15,6 +15,9 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
+#[cfg(target_os = "linux")]
+pub(super) mod canonical;
+
 type Hresult = i32;
 
 #[repr(C)]

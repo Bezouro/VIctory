@@ -462,9 +462,22 @@ fn emit_program(
         }
         l => l?,
     };
+    let dxil = l.dxil;
+    // The prop batch producer has over a thousand emitted blocks. Canonical
+    // loops let dxil-spirv compile its control flow on Linux. Keep the root
+    // mapping and the GPU instructions from the usual lowering path.
+    #[cfg(target_os = "linux")]
+    let dxil = if native.stage == HwStage::Cs
+        && c.digest == [0x0d, 0xd5, 0x5b, 0x09, 0x66, 0x8a, 0xe3, 0x55,
+                        0x44, 0x36, 0x1e, 0x93, 0x52, 0x8c, 0x9f, 0x7a]
+    {
+        validator::canonical::compute(dxil).map_err(ShaderError::HostCompiler)?
+    } else {
+        dxil
+    };
     Ok(HostShader {
         stage: native.stage,
-        dxil: l.dxil,
+        dxil,
         user_data: l.user_data,
         static_samplers: l
             .samplers

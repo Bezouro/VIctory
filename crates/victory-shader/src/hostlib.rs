@@ -126,7 +126,7 @@ pub unsafe fn serialize_versioned_root_signature(
 /// DXC's `libdxcompiler.so`, only at `VICTORY_DXCOMPILER` (Arch's
 /// 1.10.2605 build asserts on every shader, so none is found unasked),
 /// opened once.
-fn dxcompiler() -> Result<Library, &'static str> {
+pub(crate) fn dxcompiler() -> Result<Library, &'static str> {
     static LIBRARY: OnceLock<Result<Library, String>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {

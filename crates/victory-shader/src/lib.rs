@@ -31,6 +31,8 @@ pub use native::{
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
+    #[error("host shader compiler: {0}")]
+    HostCompiler(String),
     #[error("not a DXBC container")]
     NotDxbc,
     #[error("malformed shader: {0}")]
