@@ -1754,7 +1754,7 @@ extern "win64" fn resource_query(this: This, iid: *const Iid, out: *mut This) ->
         out,
     )
 }
-extern "win64" fn resource_release(this: This) -> u32 {
+pub(crate) extern "win64" fn resource_release(this: This) -> u32 {
     object::release_boxed::<Resource>(this)
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
@@ -1874,6 +1874,8 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    mod texture_readback_test { include!("resource/texture_readback_test.rs"); }
 
     type Release = extern "win64" fn(This) -> u32;
     type Map = extern "win64" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

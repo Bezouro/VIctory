@@ -10,6 +10,8 @@
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+mod readback;
+pub(crate) use readback::ReadbackDestination;
 mod uav_clear;
 
 use std::mem::offset_of;
@@ -551,8 +553,7 @@ fn prepare_footprint_upload(
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission. Texture readbacks publish at the queue fence.
 extern "win64" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -575,8 +576,12 @@ extern "win64" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            // SAFETY: the optional box is supplied for this call.
+            let region = unsafe { source_box.as_ref() }.copied();
+            if let Err(reason) = readback::record(list, dst, [x, y, z], src, region) {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| tracing::warn!(reason, footprint=?dst.footprint, "texture readback skipped"));
+            }
             return;
         };
         let mut from = src;

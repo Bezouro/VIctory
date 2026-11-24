@@ -973,6 +973,9 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    /// Readbacks retain the title destination across replays, and publish it
+    /// before any following list prepares CPU-side copies of that memory.
+    readbacks: Vec<crate::list::ReadbackDestination>,
     has_indexed_srvs: bool,
     packed_light_sources: std::collections::HashMap<usize, usize>,
     /// Destination, source, bytes.
@@ -1172,7 +1175,10 @@ impl Host {
         let mut first = 0;
         let mut prepared = std::collections::HashSet::new();
         for (i, &list) in runs.iter().enumerate() {
-            let indexed = runs.len() > 1 && list.deferred().has_indexed_srvs;
+            let work = list.deferred();
+            let indexed = runs.len() > 1 && work.has_indexed_srvs;
+            let readback = !work.readbacks.is_empty();
+            drop(work);
             if indexed && !prepared.insert(std::ptr::from_ref(list)) {
                 // Replaying this list reuses its CBV upload and predicate. Finish
                 // its first occurrence before filling either for the next.
@@ -1181,8 +1187,15 @@ impl Host {
                 prepared.clear();
                 prepared.insert(std::ptr::from_ref(list));
             }
+            if readback {
+                self.execute_unique(&runs[first..=i], &mut submitted);
+                first = i + 1;
+                prepared.clear();
+            }
         }
-        self.execute_unique(&runs[first..], &mut submitted);
+        if first < runs.len() || runs.is_empty() {
+            self.execute_unique(&runs[first..], &mut submitted);
+        }
     }
 
     fn execute_unique(&self, runs: &[&HostList], submitted: &mut u64) {
@@ -1325,6 +1338,13 @@ impl Host {
         // submission, however many dispatches declared it (the world's
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
+        if runs.last().is_some_and(|list| !list.deferred().readbacks.is_empty()) {
+            // A device loss reports UINT64_MAX. Never publish a partial readback.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            if completed == u64::MAX || completed < *submitted {
+                fail(format_args!("texture readback fence {submitted} did not complete"));
+            }
+        }
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for list in runs {
@@ -1348,7 +1368,12 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
-            for &(at, what, bytes) in &list.deferred().writes {
+            let work = list.deferred();
+            #[cfg(feature = "diagnostics")]
+            for readback in &work.readbacks {
+                readback.report(*submitted);
+            }
+            for &(at, what, bytes) in &work.writes {
                 what.write(at as *mut u8, bytes);
             }
         }
@@ -2145,6 +2170,10 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    pub(crate) fn keep_readback(&self, destination: crate::list::ReadbackDestination) {
+        self.deferred().readbacks.push(destination);
     }
 
     /// Keeps `object` alive until the list is reset.
