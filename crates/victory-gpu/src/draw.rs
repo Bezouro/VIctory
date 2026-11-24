@@ -77,7 +77,11 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, what it holds) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    fresh_tables: std::collections::HashMap<(usize, u64, u64), u32>,
+    /// Guest address, list-owned upload address, byte size of each fresh CBV.
+    table_cbvs: std::collections::HashMap<(usize, u32), (u64, usize, u32)>,
+    indexed: Vec<crate::host::CbvSrv>,
+    predicate: Option<crate::host::SrvPredicate>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -512,6 +516,8 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.indexed.clear();
+        self.predicate = None;
         let l = &list.list;
         #[cfg(feature = "diagnostics")]
         if compute && crate::pipeline::trace_compute(&p.name) {
@@ -588,6 +594,9 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
+                return false;
+            }
+            if !self.refresh_cbv_indexed_reads(list, &t.host.indexed_reads, &made, compute, &p.name) {
                 return false;
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
@@ -993,7 +1002,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         let producer = self.sample_producer(list);
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        self.indexed_command(list, || unsafe { list.list.Dispatch(x, y, z) });
         #[cfg(feature = "diagnostics")]
         if let Some(sample) = pack { sample.after(list); }
         #[cfg(feature = "diagnostics")]
@@ -1057,7 +1066,7 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     let validation = crate::validation::Draws::begin(list);
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    self.indexed_command(list, || unsafe { l6.DispatchMesh(x, 1, 1) });
                     #[cfg(feature = "diagnostics")]
                     crate::capture::MeshStats::end(list, query);
                     #[cfg(feature = "diagnostics")]
@@ -1089,7 +1098,7 @@ impl State {
         if reads.is_empty() || self.heaps[0] == 0 { return; }
         let heap = crate::descriptor::heap(self.heaps[0] as This);
         let Some(host) = heap.host() else { return };
-        for read in reads {
+        for read in reads.iter().filter(|r| r.table_offset_dwords.is_none()) {
             let Some(Root::Constants(words)) = self.roots_ref(compute).get(usize::from(read.slot)) else { continue };
             let Some(&word) = words.get(read.dword as usize) else { continue };
             let index = word.wrapping_shl(5).wrapping_add(read.byte_offset) >> 5;
@@ -1108,6 +1117,58 @@ impl State {
                 shadow.refresh(list, address, len);
                 list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
             }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_cbv_table(&mut self, list: &HostList, used: &UsedResource,
+        read: victory_shader::resource::IndexedRead) -> u32 {
+        let tables = self.tables(list, std::slice::from_ref(used), true);
+        assert!(!self.table_failed);
+        assert!(self.refresh_cbv_indexed_reads(list, &[read], &tables, true, "synthetic"));
+        tables[0].1 / 32 + used.table_offset_dwords / 8
+    }
+
+    fn refresh_cbv_indexed_reads(
+        &mut self, list: &HostList, reads: &[victory_shader::resource::IndexedRead], tables: &[(u8, u32)],
+        compute: bool, _name: &str,
+    ) -> bool {
+        for read in reads {
+            let Some(offset) = read.table_offset_dwords else { continue };
+            let Some(&(_, table)) = tables.iter().find(|&&(slot, _)| slot == read.slot) else { continue };
+            let Some(slot) = offset.checked_mul(4).and_then(|bytes| table.checked_add(bytes)).map(|b| b / 32) else { continue };
+            let Some(&(guest, upload, size)) = self.table_cbvs.get(&(self.heaps[0], slot)) else { continue };
+            let byte = u64::from(read.dword) * 4;
+            if byte + 4 > u64::from(size) { continue; }
+            let heap = crate::descriptor::heap(self.heaps[0] as This);
+            let Some(host) = heap.host() else { continue };
+            let Some(addr) = guest.checked_add(byte).filter(|a| a.checked_add(4).is_some()) else { continue };
+            let mut bytes = [0u8; 4];
+            let indexed = |word: u32| word.wrapping_shl(5).wrapping_add(read.byte_offset) >> 5;
+            let predicted = crate::host::read_into(addr as *const u8, &mut bytes)
+                .then(|| host.indexed_srv(heap, indexed(u32::from_le_bytes(bytes)))).flatten();
+            if let Some(srv) = &predicted {
+                list.buffer_state(&srv.shadow.buffer, crate::host::BUFFER_READ);
+            }
+            if self.predicate.is_none() {
+                self.predicate = list.srv_predicate();
+                if self.predicate.is_none() { return false; }
+            }
+            self.indexed.push(crate::host::CbvSrv {
+                compute, heap: heap.retained(), upload: upload + byte as usize, read: *read,
+                #[cfg(feature = "diagnostics")]
+                trace: (compute && crate::pipeline::trace_compute(_name)).then(|| _name.to_owned()),
+            });
+        }
+        true
+    }
+
+    pub(crate) fn indexed_command(&mut self, list: &HostList, command: impl FnOnce()) {
+        if let Some(predicate) = self.predicate.take() {
+            list.defer_indexed_srvs(std::mem::take(&mut self.indexed), &predicate);
+            predicate.run(list, command);
+        } else {
+            command();
         }
     }
 
@@ -1205,7 +1266,7 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
                 }
-                (table, h.finish())
+                (std::ptr::from_ref(heap) as usize, table, h.finish())
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -1241,6 +1302,7 @@ impl State {
                             continue;
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
+                        self.table_cbvs.insert((std::ptr::from_ref(heap) as usize, index), (address, to as usize, size));
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
@@ -1352,10 +1414,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             let validation = crate::validation::Draws::begin(list);
             // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawInstanced(count, instances, from, first_instance)
-            };
+            self.indexed_command(list, || unsafe { list.list.DrawInstanced(count, instances, from, first_instance) });
             #[cfg(feature = "diagnostics")]
             crate::validation::Draws::end(list, validation, self.pipeline as This, &self.targets, &self.target_formats);
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1443,10 +1502,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             let validation = crate::validation::Draws::begin(list);
             // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
+            self.indexed_command(list, || unsafe { list.list.DrawIndexedInstanced(indices, instances, first, base, first_instance) });
             #[cfg(feature = "diagnostics")]
             crate::validation::Draws::end(list, validation, self.pipeline as This, &self.targets, &self.target_formats);
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1597,13 +1653,13 @@ impl State {
                 count:counter.as_ref().map(|(s,at)|(&s.buffer,s.offset(*at))),
             });
         }
-        crate::indirect::execute(
+        self.indexed_command(list, || crate::indirect::execute(
             list,
             &signature,
             max,
             (&args.buffer, args.offset(arguments)),
             counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
-        );
+        ));
         #[cfg(feature = "diagnostics")]
         crate::capture::MeshStats::end(list, query);
         #[cfg(feature = "diagnostics")]

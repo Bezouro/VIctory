@@ -6,6 +6,11 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
+mod indexed;
+pub(crate) use indexed::{CbvSrv, SrvPredicate};
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) use indexed::indexed_suppressed;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -756,12 +761,19 @@ pub(crate) const BUFFER_WRITE: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as 
 /// tracked, and a command that both writes a buffer and reads it as
 /// vertices, indices or arguments leaves it in the read state.
 pub(crate) struct BufferStates<R> {
+    /// From the first CBV-selected heap read onwards, the state on either
+    /// side of each recorded transition. Needed only when the selected
+    /// buffer changes between recording and submission.
+    indexed_states: Option<std::collections::HashMap<usize, Vec<(usize, u32)>>>,
+    sequence: usize,
     by_copy: std::collections::HashMap<usize, (u32, u32, R)>,
 }
 
 impl<R> Default for BufferStates<R> {
     fn default() -> Self {
         BufferStates {
+            indexed_states: None,
+            sequence: 0,
             by_copy: std::collections::HashMap::new(),
         }
     }
@@ -772,6 +784,13 @@ impl<R> BufferStates<R> {
     /// if a transition must be recorded now. A first use records nothing:
     /// the prelude moves the buffer there.
     pub(crate) fn update(&mut self, copy: usize, resource: R, wanted: u32) -> Option<u32> {
+        if let Some(history) = &mut self.indexed_states {
+            let entries = history.entry(copy).or_default();
+            if entries.last().is_none_or(|&(_, state)| state != wanted) {
+                self.sequence += 1;
+                entries.push((self.sequence, wanted));
+            }
+        }
         match self.by_copy.entry(copy) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert((wanted, wanted, resource));
@@ -782,6 +801,20 @@ impl<R> BufferStates<R> {
                 (before != wanted).then_some(before)
             }
         }
+    }
+
+    fn indexed_position(&mut self) -> usize {
+        self.indexed_states.get_or_insert_with(|| self.by_copy.iter()
+            .map(|(&key, &(_, last, _))| (key, vec![(0, last)])).collect());
+        self.sequence
+    }
+
+    /// Untracked buffers are in COMMON and promote implicitly for SRV reads.
+    /// A tracked buffer's first state is established before the whole list.
+    fn allows_indexed_read(&self, key: usize, position: usize) -> bool {
+        let Some(entries) = self.indexed_states.as_ref().and_then(|m| m.get(&key)) else { return true };
+        let after = entries.partition_point(|&(at, _)| at <= position);
+        entries[after.saturating_sub(1)].1 == BUFFER_READ
     }
 
     /// The prelude's transitions: each buffer from common to its first state.
@@ -797,6 +830,8 @@ impl<R> BufferStates<R> {
 
     pub(crate) fn clear(&mut self) {
         self.by_copy.clear();
+        self.indexed_states = None;
+        self.sequence = 0;
     }
 }
 
@@ -902,6 +937,12 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
+    /// Index in the exact list-owned CBV upload that the shader will read.
+    IndexedSrvs {
+        reads: Vec<CbvSrv>,
+        position: usize,
+        predicate: usize,
+    },
     /// A copy into title memory (destination, source, bytes): the title's
     /// buffer copies, which later refreshes must see.
     Copy(usize, usize, usize),
@@ -932,6 +973,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    has_indexed_srvs: bool,
     packed_light_sources: std::collections::HashMap<usize, usize>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
@@ -1083,6 +1125,23 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut first = 0;
+        let mut prepared = std::collections::HashSet::new();
+        for (i, &list) in runs.iter().enumerate() {
+            let indexed = runs.len() > 1 && list.deferred().has_indexed_srvs;
+            if indexed && !prepared.insert(std::ptr::from_ref(list)) {
+                // Replaying this list reuses its CBV upload and predicate. Finish
+                // its first occurrence before filling either for the next.
+                self.execute_unique(&runs[first..i], &mut submitted);
+                first = i;
+                prepared.clear();
+                prepared.insert(std::ptr::from_ref(list));
+            }
+        }
+        self.execute_unique(&runs[first..], &mut submitted);
+    }
+
+    fn execute_unique(&self, runs: &[&HostList], submitted: &mut u64) {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -1989,6 +2048,11 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_slice(len, |_, gpu, offset, data| (gpu + offset, data))
+    }
+
+    fn scratch_slice<T>(&self, len: u64,
+        result: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> T) -> Option<T> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -1997,8 +2061,9 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let slice = result(&buffer, gpu, 0, data);
             self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            return Some(slice);
         }
         if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
@@ -2011,10 +2076,10 @@ impl HostList {
             s.chunks.push((buffer, data as usize, gpu));
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
         let at = s.used;
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let (buffer, data, gpu) = &s.chunks[s.current];
+        Some(result(buffer, *gpu, at, (*data + at as usize) as *mut u8))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -2099,6 +2164,10 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
+                Step::IndexedSrvs { reads, position, predicate } => {
+                    self.prepare_indexed_srvs(reads, *position, *predicate, batch);
+                    continue;
+                }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -2149,6 +2218,9 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
+    /// A physical heap slot must keep the same record while previous lists
+    /// that read it are still waiting for execution.
+    indexed_slots: std::collections::HashMap<(usize, u32), [u32; 3]>,
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<std::ops::Range<usize>>)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,

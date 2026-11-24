@@ -66,6 +66,14 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 }
 
 impl Heap {
+    /// Keep the guest allocation and its host mirror alive until submissions
+    /// which read a CBV-selected slot have finished.
+    pub(crate) fn retained(&self) -> RetainedHeap {
+        let at = std::ptr::from_ref(self) as usize;
+        object::add_ref(at as This);
+        RetainedHeap(at)
+    }
+
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
@@ -104,6 +112,16 @@ impl Heap {
         let index = at / step;
         (index < u64::from(self.desc.count)).then_some(index as u32)
     }
+}
+
+pub(crate) struct RetainedHeap(usize);
+
+impl RetainedHeap {
+    pub(crate) fn get(&self) -> &Heap { heap(self.0 as This) }
+}
+
+impl Drop for RetainedHeap {
+    fn drop(&mut self) { release(self.0 as This); }
 }
 
 const VIEWS_KIND: u32 = 0;

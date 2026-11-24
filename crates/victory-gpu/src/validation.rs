@@ -49,6 +49,8 @@ pub(crate) fn log(frame: u64, completed_fence: Option<u64>) {
         let checkpoint = if completed_fence.is_some() { "selected pass counters" } else { "render validation" };
         tracing::info!(frame, compute_requested = COMPUTE_REQUESTED.load(Relaxed),
             compute_dropped = COMPUTE_DROPPED.load(Relaxed), compute_pending = PENDING_MISSES.load(Relaxed),
+            compute_suppressed_at_submit = crate::host::indexed_suppressed(true),
+            graphics_suppressed_at_submit = crate::host::indexed_suppressed(false),
             compute_unavailable = FAILED_MISSES.load(Relaxed), first_binds = FIRST_BINDS.load(Relaxed),
             ready_before_bind = READY_BEFORE_BIND.load(Relaxed), draws_completed = COMPLETED.load(Relaxed),
             draws_measured = MEASURED.load(Relaxed), draws_active = ACTIVE.load(Relaxed),

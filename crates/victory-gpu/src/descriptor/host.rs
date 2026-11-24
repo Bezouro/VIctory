@@ -45,6 +45,23 @@ pub(crate) struct HostHeap {
     aliases: Mutex<Aliases>,
 }
 
+pub(crate) struct IndexedSrv {
+    index: u32,
+    pub(crate) words: [u32; 3],
+    pub(crate) shadow: std::sync::Arc<crate::shadow::Shadow>,
+    pub(crate) address: u64,
+    pub(crate) len: u64,
+}
+
+impl IndexedSrv {
+    pub(crate) fn materialize(&self, heap: &HostHeap) -> bool {
+        use windows::core::Interface;
+        if heap.mirror_record(self.index, self.words, true).is_none() { return false; }
+        let kept = heap.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept[self.index as usize].as_ref().is_some_and(|r| r.as_raw() == self.shadow.buffer.as_raw())
+    }
+}
+
 /// The raw views of the bytes structured and typed buffer views read, for
 /// shaders that read such a buffer without knowing its stride: they take a
 /// raw handle, which reads a raw view only (over the title's own view the
@@ -631,6 +648,53 @@ impl HostHeap {
         let mut record = [0u32; 3];
         crate::host::copy_mapped(record.as_mut_ptr().cast(), handle as *const u8, size_of_val(&record), false);
         self.mirror_record(index, record, true)
+    }
+
+    fn indexed_record(&self, heap: &super::Heap, index: u32) -> Option<[u32; 3]> {
+        if index >= self.count { return None; }
+        let handle = heap.start.checked_add(u64::from(index) * 32)?;
+        if heap.index(handle) != Some(index) { return None; }
+        let mut words = [0u32; 3];
+        // SAFETY: these three local record words are writable.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast(), size_of_val(&words)) };
+        crate::host::read_into(handle as *const u8, bytes).then_some(words)
+    }
+
+    /// Resolve only a live buffer SRV, using the same bounded view extent
+    /// and backing allocation as buffer_srv. Inspect the record before
+    /// creating a host descriptor: a CBV index may instead designate a
+    /// sampler, texture, UAV, or an unwritten slot.
+    pub(crate) fn indexed_srv(&self, heap: &super::Heap, index: u32) -> Option<IndexedSrv> {
+        let words @ [VIEW_TAG, id, generation] = self.indexed_record(heap, index)? else { return None };
+        let view = view_at(id, generation)?;
+        let (base, span, desc) = match &view {
+            View::Shader(r, Some(desc)) => {
+                let (data, size) = crate::resource::buffer_bytes(*r as crate::object::This)?;
+                (data as u64, size, srv_desc(desc))
+            }
+            View::Placed(false, r, d) if r[0] == 1 => (
+                u64::from(d[10]) | u64::from(d[11]) << 32,
+                u64::from(r[4]) | u64::from(r[5]) << 32,
+                srv_desc(d[..10].try_into().ok()?),
+            ),
+            _ => return None,
+        };
+        if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER { return None; }
+        let shadow = crate::shadow::find_registered(base, span)?;
+        let element = element_size(&desc);
+        // SAFETY: the view dimension is BUFFER.
+        let b = unsafe { desc.Anonymous.Buffer };
+        let count = view_elements(b.FirstElement, b.NumElements, element, span)?;
+        let address = base.checked_add(b.FirstElement.checked_mul(element)?)?;
+        Some(IndexedSrv { index, words, shadow, address, len: u64::from(count) * element })
+    }
+
+    pub(crate) fn stale_indexed_slot(&self, heap: &super::Heap, index: u32) -> bool {
+        if index >= self.count { return false; }
+        let previous = self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize];
+        if previous == 0 { return false; }
+        let Some([VIEW_TAG, id, generation]) = self.indexed_record(heap, index) else { return true; };
+        previous != ((u64::from(generation) << 32) | u64::from(id)) || view_at(id, generation).is_none()
     }
 
     fn mirror_record(&self, index: u32, [tag, i, generation]: [u32; 3], for_draw: bool) -> Option<View> {
@@ -2407,6 +2471,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 
     mod packed_lighting;
+    mod indexed_cbv;
 
     #[test]
     fn compute_dispatch_writes_placed_texture_and_buffer_uavs() {
