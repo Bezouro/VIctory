@@ -220,7 +220,7 @@ static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
 #[cfg(feature = "diagnostics")]
-fn parse_skip_hashes(value: &str) -> Vec<String> {
+fn parse_shader_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(str::trim)
@@ -231,7 +231,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
             } else {
                 tracing::warn!(
                     hash,
-                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
+                    "expected a 16-digit shader hash"
                 );
                 None
             }
@@ -285,7 +285,7 @@ fn skipped_shader(shaders: &[Arc<Shader>]) -> Option<&str> {
     static WAVE64: OnceLock<Vec<&'static str>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        parse_shader_hashes(&value)
     });
     let wave64 = WAVE64.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_WAVE64").unwrap_or_default();
@@ -556,9 +556,9 @@ mod tests {
     #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
-        assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert!(super::parse_shader_hashes(" , ").is_empty());
         assert_eq!(
-            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
+            super::parse_shader_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
     }

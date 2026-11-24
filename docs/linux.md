@@ -205,3 +205,8 @@ at 2560×1440, use `2560x1440`. Frames with no matching target follow the
 title's normal presentation path. This is a diagnostic view of an internal
 surface and can show unlit geometry. The selection follows the upstream
 community's [1440p presentation experiment](https://github.com/mpDom/VIctory/commit/d6897facd92d6dd7f1a0d5177cf84e3d95a4951b).
+
+When investigating a specific draw, set `VICTORY_PREWARM_SHADERS` to its
+comma-separated 16-digit shader hashes from the first-bind log. Previously
+requested pipelines containing them move ahead of other speculative compiles
+during loading. Draws that the current frame already needs retain priority.

@@ -350,6 +350,11 @@ impl Work {
         if p.used.load(Ordering::Relaxed) {
             self.needed.push_back(p);
         } else {
+            #[cfg(feature = "diagnostics")]
+            if preferred(&p) {
+                self.early.push_front(p);
+                return;
+            }
             self.early.push_back(p);
         }
     }
@@ -363,6 +368,16 @@ impl Work {
     fn pop(&mut self) -> Option<Arc<Pending>> {
         self.needed.pop_front().or_else(|| self.early.pop_front())
     }
+}
+
+/// Specific shaders under investigation can be warmed during title loading.
+#[cfg(feature = "diagnostics")]
+fn preferred(p: &Pending) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        super::parse_shader_hashes(&std::env::var("VICTORY_PREWARM_SHADERS").unwrap_or_default())
+    });
+    !hashes.is_empty() && p.shaders.iter().any(|s| hashes.contains(&s.hash))
 }
 
 static WORK: Mutex<Work> = Mutex::new(Work::new());
