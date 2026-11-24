@@ -1473,7 +1473,9 @@ fn unwatch(runs: &Runs, shown: &mut Shown, lo: usize, hi: usize) {
 /// are guarded again. A block is watched when one run of committed
 /// read-write memory holds it, and every block showing the same section
 /// pages is watched with it (guarded too: a write through any of them
-/// counts); a block that cannot be counts as written every time. `None`
+/// counts). A dirty group reports all addresses it re-arms, including
+/// aliases outside the requested range. A block that cannot be watched
+/// counts as written every time. `None`
 /// when the table has nothing in the range, or (`views` false) when part
 /// of it is a view.
 pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
@@ -1495,6 +1497,7 @@ pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
     };
     let (first, last) = (lo / BLOCK, hi.div_ceil(BLOCK));
     let (mut written, mut protect, mut ours) = (Vec::new(), Vec::new(), false);
+    let mut included_aliases = false;
     let mut next = first; // blocks below are decided
     let from = find(runs, first * BLOCK).unwrap_or(first * BLOCK);
     for (&s, r) in runs.range(from..last * BLOCK) {
@@ -1525,6 +1528,12 @@ pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
             }
             if !clean {
                 written.push(block);
+                // Every alias is about to look clean to a later guard call.
+                // Report them now so copies at other addresses see the write.
+                if let Some(aliases) = group.filter(|g| g.len() > 1) {
+                    included_aliases = true;
+                    written.extend(aliases.iter().copied().filter(|&alias| alias != block));
+                }
             }
         }
         next = next.max(b);
@@ -1554,6 +1563,10 @@ pub fn guard(lo: usize, hi: usize, views: bool) -> Option<Vec<usize>> {
             }
         }
         i = j;
+    }
+    if included_aliases {
+        written.sort_unstable();
+        written.dedup();
     }
     Some(written)
 }
@@ -2060,24 +2073,27 @@ mod tests {
         let (b, end) = (va / g, va + 2 * g);
         // Page 0 at 0 and 2, page 1 at 1.
         phys_map(va, &[pages[0], pages[1], pages[0]], PAGE_READWRITE).unwrap();
-        assert_eq!(guard(va, end, true), Some(vec![b, b + 1]));
+        assert_eq!(guard(va, end, true), Some(vec![b, b + 1, b + 2]));
         assert_eq!(guard(va, end, true), Some(vec![]));
         // SAFETY: mapped read-write (to the table).
         unsafe { ((va + 2 * g + 5) as *mut u8).write(9) };
-        assert_eq!(guard(va, end, true), Some(vec![b]));
+        // Watching the first address re-arms the alias outside this query.
+        // Its separate GPU copy must learn about the write at the same time.
+        assert_eq!(guard(va, end, true), Some(vec![b, b + 2]));
+        assert_eq!(guard(va + 2 * g, va + 3 * g, true), Some(vec![]));
         // SAFETY: mapped.
         assert_eq!(unsafe { ((va + 5) as *const u8).read() }, 9);
         // A new alias of page 1 (the GPU's page-mapping copies) counts once,
         // then writes through it count.
         alias(va + 3 * g, va + g, g).unwrap();
-        assert_eq!(guard(va, end, true), Some(vec![b + 1]));
+        assert_eq!(guard(va, end, true), Some(vec![b + 1, b + 3]));
         assert_eq!(guard(va, end, true), Some(vec![]));
         // SAFETY: mapped read-write.
         unsafe { ((va + 3 * g) as *mut u8).write(1) };
-        assert_eq!(guard(va, end, true), Some(vec![b + 1]));
+        assert_eq!(guard(va, end, true), Some(vec![b + 1, b + 3]));
         // Written into the pool outside the views (DirectStorage).
         pool_written(&[pages[0]]);
-        assert_eq!(guard(va, end, true), Some(vec![b]));
+        assert_eq!(guard(va, end, true), Some(vec![b, b + 2]));
         assert_eq!(guard(va, end, false), None, "views are left to the caller");
         free(va, 0, MEM_RELEASE).unwrap();
         let state = state();

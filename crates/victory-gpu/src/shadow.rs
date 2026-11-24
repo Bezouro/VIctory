@@ -617,6 +617,43 @@ mod tests {
         unsafe { (at as *const u8).read_volatile() }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a Vulkan device"]
+    fn two_shadows_refresh_after_one_aliased_title_write() {
+        use victory_loader::linux::{signals, vm};
+
+        let host = host().expect("a Vulkan device is required");
+        signals::install();
+        let section = vm::Section::new(PAGE as u64).unwrap();
+        let addresses: [usize; 2] = std::array::from_fn(|_| {
+            vm::map_view(&section, 0, PAGE, 0, vm::PAGE_READWRITE, false).unwrap()
+        });
+        let shadows = addresses.map(|address| {
+            let (buffer, data) = host.shared_buffer(PAGE as u64).unwrap();
+            // SAFETY: the buffer is still owned by this shadow.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            Shadow::new(buffer, data, gpu, address as u64, PAGE as u64)
+        });
+        poke(addresses[1] + 19, 37);
+        for (address, shadow) in addresses.into_iter().zip(&shadows) {
+            assert_eq!(shadow.update(address, PAGE), PAGE);
+            assert_eq!(peek(shadow.data as usize + 19), 37);
+        }
+
+        // Refreshing the first mapping re-arms the write guard on both.
+        poke(addresses[1] + 19, 93);
+        let updated = std::array::from_fn::<_, 2, _>(|i| shadows[i].update(addresses[i], PAGE));
+        let copied = shadows.each_ref().map(|shadow| peek(shadow.data as usize + 19));
+        let clean = std::array::from_fn::<_, 2, _>(|i| shadows[i].update(addresses[i], PAGE));
+        for address in addresses {
+            vm::unmap_view(address, false).unwrap();
+        }
+        assert_eq!(updated, [PAGE; 2]);
+        assert_eq!(copied, [93; 2]);
+        assert_eq!(clean, [0; 2]);
+    }
+
     /// A range declared after ranges on both sides of it, once the snapshot
     /// already spans it: what its refresh brought into the copy is not a
     /// shader's write, and does not go back over what the title wrote since.
