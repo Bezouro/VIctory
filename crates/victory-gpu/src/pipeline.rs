@@ -62,6 +62,10 @@ pub(crate) struct Shader {
     pub(crate) hash: String,
     container: Vec<u8>,
     translated: OnceLock<Option<Translated>>,
+    /// Whether its native program runs in 64-lane console waves
+    /// (diagnostics: `VICTORY_SKIP_WAVE64`).
+    #[cfg(feature = "diagnostics")]
+    wave64: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -86,6 +90,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 translated: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                wave64: OnceLock::new(),
             })
         })
         .clone()
@@ -134,7 +140,8 @@ impl Shader {
 
 fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
-    let host = crate::shader_cache::host_shader(container)?;
+    let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
+    let host = crate::shader_cache::host_shader(container, target)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
@@ -232,19 +239,66 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The stages `VICTORY_SKIP_WAVE64` names (`mesh`, `compute`, `vertex`,
+/// `pixel`).
+#[cfg(feature = "diagnostics")]
+fn parse_skip_stages(value: &str) -> Vec<&'static str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let stage = ["mesh", "compute", "vertex", "pixel"]
+                .into_iter()
+                .find(|&k| k.eq_ignore_ascii_case(s));
+            if stage.is_none() {
+                tracing::warn!(
+                    stage = s,
+                    "VICTORY_SKIP_WAVE64 expects mesh, compute, vertex or pixel"
+                );
+            }
+            stage
+        })
+        .collect()
+}
+
+#[cfg(feature = "diagnostics")]
+impl Shader {
+    /// Whether the container's native program runs in 64-lane console waves.
+    fn wave64(&self) -> bool {
+        *self.wave64.get_or_init(|| {
+            victory_shader::Container::parse(&self.container)
+                .ok()
+                .and_then(|c| {
+                    c.part(victory_shader::FourCC::DXIL)
+                        .map(|p| p.data.to_vec())
+                })
+                .and_then(|d| victory_shader::native::native_programs(&d).ok())
+                .is_some_and(|ps| ps.iter().any(|p| p.wave64))
+        })
+    }
+}
+
 #[cfg(feature = "diagnostics")]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    static WAVE64: OnceLock<Vec<&'static str>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
-    if hashes.is_empty() {
+    let wave64 = WAVE64.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_WAVE64").unwrap_or_default();
+        parse_skip_stages(&value)
+    });
+    if hashes.is_empty() && wave64.is_empty() {
         return None;
     }
     p.shaders
         .iter()
-        .find(|shader| hashes.contains(&shader.hash))
+        .find(|shader| {
+            hashes.contains(&shader.hash) || (wave64.contains(&shader.stage) && shader.wave64())
+        })
         .map(|shader| shader.hash.as_str())
 }
 
@@ -491,6 +545,17 @@ pub fn save_pipeline_cache() {
 mod tests {
     #[cfg(feature = "diagnostics")]
     #[test]
+    fn skip_stages_names_known_stages_only() {
+        assert_eq!(
+            super::parse_skip_stages(" mesh,Compute ,,"),
+            ["mesh", "compute"]
+        );
+        assert_eq!(super::parse_skip_stages("hull,pixel"), ["pixel"]);
+        assert!(super::parse_skip_stages("").is_empty());
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
         assert_eq!(
@@ -605,3 +670,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod depth_bounds_test;
