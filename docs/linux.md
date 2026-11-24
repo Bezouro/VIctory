@@ -279,6 +279,10 @@ Each graphics call also receives a pipeline-statistics query. Active counts call
 or fragment invocations. Shaded counts those with fragment invocations.
 Each ExecuteIndirect counts as one API call and may execute multiple records.
 A mesh group that emits nothing can remain invisible to the legacy counters.
+In a validation run, `VICTORY_IDENTIFY_SHADED=1` records the pipeline key,
+shader hashes and pixel invocations of each draw with a positive result.
+It reports after fence completion, including draws from a frame that has
+not yet been presented.
 
 `VICTORY_COMPARE_PASSES` selects a shader by hash and snapshots the host
 colour slots after matching draws numbered by `VICTORY_COMPARE_OCCURRENCES`.

@@ -9,6 +9,12 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("VICTORY_VALIDATE").as_deref() == Ok("1"))
 }
 
+/// Record the exact host PSO for draws which the GPU confirms shaded pixels.
+fn identify_shaded() -> bool {
+    static IDENTIFY: OnceLock<bool> = OnceLock::new();
+    *IDENTIFY.get_or_init(|| std::env::var("VICTORY_IDENTIFY_SHADED").as_deref() == Ok("1"))
+}
+
 static FIRST_BINDS: AtomicU64 = AtomicU64::new(0);
 static READY_BEFORE_BIND: AtomicU64 = AtomicU64::new(0);
 static COMPUTE_REQUESTED: AtomicU64 = AtomicU64::new(0);
@@ -59,6 +65,7 @@ pub(crate) struct Draws {
     pages: Vec<Option<Storage>>,
     captures: Vec<crate::capture::PassImage>,
     selected: Vec<(u32, &'static str, u64)>,
+    labels: Vec<Option<String>>,
 }
 
 impl Draws {
@@ -66,6 +73,7 @@ impl Draws {
         self.count = 0;
         self.captures.clear();
         self.selected.clear();
+        self.labels.clear();
     }
 
     pub(crate) fn begin(list: &HostList) -> Option<u32> {
@@ -90,6 +98,11 @@ impl Draws {
         if let Some(index) = query {
             let (heap, _) = d.pages[(index / PAGE) as usize].as_ref().expect("started query");
             unsafe { list.list.EndQuery(heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, index % PAGE) };
+            if identify_shaded() {
+                // Keep an owned name: the title can release its pipeline after recording.
+                d.labels.resize_with(index as usize + 1, || None);
+                d.labels[index as usize] = Some(crate::pipeline::stage_names(pipeline));
+            }
         }
         if let Some((hash, occurrence)) = capture_occurrence(pipeline) {
             if let Some(index) = query { d.selected.push((index, hash, occurrence)); }
@@ -132,7 +145,13 @@ impl Draws {
                 }
                 let mut active = 0;
                 let mut shaded = 0;
-                for s in stats {
+                for (slot, s) in stats.iter().enumerate() {
+                    let draw = page * PAGE as usize + slot;
+                    if s.PSInvocations != 0 && let Some(Some(label)) = self.labels.get(draw) {
+                        tracing::info!(frame = crate::queue::presented() + 1, draw, pipeline = %label,
+                            clipped_primitives = s.CPrimitives, pixel_invocations = s.PSInvocations,
+                            "identified shaded draw");
+                    }
                     active += u64::from(s.VSInvocations != 0 || s.CInvocations != 0 || s.PSInvocations != 0);
                     shaded += u64::from(s.PSInvocations != 0);
                 }
