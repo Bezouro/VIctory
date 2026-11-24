@@ -5,6 +5,27 @@ use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::DXGI_FORMAT_R32_TYPE
 
 #[test]
 fn first_compute_dispatch_feeds_the_next_dispatch() {
+    // The wait budget and device are process-wide. Start with a cold PSO
+    // and a zero budget even when other GPU tests have already run.
+    const CHILD: &str = "VICTORY_TEST_FIRST_DISPATCH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let name =
+            "pipeline::compute_dispatch_test::first_compute_dispatch_feeds_the_next_dispatch";
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture"])
+            .env(CHILD, "1")
+            .env("VICTORY_PSO_WAIT_MS", "0")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{stdout}{stderr}"
+        );
+        eprint!("{stderr}");
+        return;
+    }
     let Some(host) = host() else {
         eprintln!("skipped compute dependency test: no host device");
         return;
