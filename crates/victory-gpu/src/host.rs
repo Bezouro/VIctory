@@ -1802,8 +1802,7 @@ impl HostList {
         }
     }
 
-    /// Current state after binding, so a diagnostic copy can restore it before dispatch.
-    #[cfg(feature = "diagnostics")]
+    /// Current state after binding, so clears and diagnostic copies can restore it.
     pub(crate) fn bound_buffer_state(&self, buffer: &ID3D12Resource) -> Option<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         buffers.by_copy.get(&(buffer.as_raw() as usize)).map(|(_, last, _)| *last)
