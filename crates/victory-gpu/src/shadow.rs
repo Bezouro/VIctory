@@ -40,9 +40,8 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// Disjoint snapshots by offset, covering only declared shader writes.
+    before: Mutex<BTreeMap<usize, Vec<u8>>>,
 }
 
 #[cfg(test)]
@@ -151,10 +150,8 @@ impl Shadow {
 
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
+    /// only newly declared intervals need storage. World draws often add
+    /// overlapping views of the same 174 MB heap to one submission.
     pub(crate) fn writing(&self, address: usize, len: usize) {
         let (from, to) = self.inside(address, len);
         // The parts no earlier range of the submission declared: their
@@ -167,39 +164,18 @@ impl Shadow {
             pending.push((address, address + len));
             fresh
         };
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let old = match &*before {
-            Some((at, bytes)) => (*at, at + bytes.len()),
-            None => (from, from),
-        };
-        let (start, end) = (old.0.min(from), old.1.max(to));
-        if (start, end) != old {
-            // Parts newly covered from the copy, the rest as it was taken.
-            let mut grown = pooled(end - start);
-            match before.take() {
-                Some((at, bytes)) => {
-                    grown.extend_from_slice(host(start, at));
-                    grown.extend_from_slice(&bytes);
-                    grown.extend_from_slice(host(at + bytes.len(), end));
-                    give_back(bytes);
-                }
-                None => grown.extend_from_slice(host(start, end)),
-            }
-            *before = Some((start, grown));
+        if fresh.is_empty() {
+            return;
         }
-        // What the snapshot already held of the fresh parts (it spans the
-        // gaps between the ranges declared so far) was taken before their
-        // refresh: taken again, or the refresh would pass for a shader's
-        // write and go back over what the title writes meanwhile.
-        if let Some((at, bytes)) = &mut *before {
-            for (a, e) in fresh {
-                let (a, e) = (a.max(old.0), e.min(old.1));
-                if a < e {
-                    bytes[a - *at..e - *at].copy_from_slice(host(a, e));
-                }
-            }
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        for (start, end) in fresh {
+            // SAFETY: these offsets are inside the mapped host buffer.
+            let bytes = unsafe { std::slice::from_raw_parts(self.data.add(start), end - start) };
+            // Keep existing chunks in place. A small addition at either end
+            // of a large range must not copy the entire previous snapshot.
+            let mut chunk = pooled(bytes.len());
+            chunk.extend_from_slice(bytes);
+            before.insert(start, chunk);
         }
     }
 
@@ -214,72 +190,81 @@ impl Shadow {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
-        let start = self.start as usize;
-        if let Some((taken, before)) = &mut *snapshot
-            && *taken <= from
-            && to <= *taken + before.len()
-            && from < to
-        {
-            let before = &mut before[from - *taken..to - *taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            let mut runs: Vec<(usize, usize)> = Vec::new();
-            let mut at = from;
-            while at < to {
-                let n = (PIECE - (start + at) % PIECE).min(to - at);
-                // SAFETY: inside the mapping; only the submitting thread
-                // writes it.
-                let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &mut before[at - from..at - from + n];
-                let title = &mut title[..n];
-                if host != old {
-                    // Title threads can write other bytes after this read,
-                    // including through an alias. Refresh the page on the
-                    // next draw even when every GPU byte was written back.
-                    copied[(start + at) / PAGE - start / PAGE] = 0;
-                    if !crate::host::read_into((start + at) as *const u8, title) {
-                        at += n;
-                        continue;
-                    }
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn, and so does the
-                    // snapshot: to a later range that overlaps this one,
-                    // they are not a shader's write to put back.
-                    #[cfg(test)]
-                    AFTER_READ.with(|hook| {
-                        if let Some(f) = hook.borrow().as_ref() { f(); }
-                    });
-                    runs.clear();
-                    for (i, ((t, h), o)) in title.iter_mut().zip(host.iter_mut()).zip(old).enumerate() {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            match runs.last_mut() {
-                                Some((_, end)) if *end == i => *end += 1,
-                                _ => runs.push((i, i + 1)),
-                            }
-                        }
-                        *h = *t;
-                        *o = *t;
-                    }
-                    if let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) {
-                        crate::watch::writing(start + at + first, last - first);
-                        written += crate::host::write_changed(start + at, title, &runs);
-                    }
+        if from < to {
+            // A chunk can start before the requested range and overlap it.
+            let first = snapshot.range(..=from).next_back().map_or(from, |(&at, _)| at);
+            for (&at, bytes) in snapshot.range_mut(first..to) {
+                let a = from.max(at);
+                let b = to.min(at + bytes.len());
+                if a < b {
+                    written += self.merge_chunk(a, &mut bytes[a - at..b - at]);
                 }
-                at += n;
             }
         }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
+        if pending.is_empty() {
+            for (_, bytes) in std::mem::take(&mut *snapshot) {
+                give_back(bytes);
+            }
+        }
+        written
+    }
+
+    /// Merge GPU changes in one captured interval back into guest memory.
+    fn merge_chunk(&self, from: usize, before: &mut [u8]) -> usize {
+        let start = self.start as usize;
+        let to = from + before.len();
+        let mut written = 0;
+        // By 64 KiB piece: the copy compared with its bytes before the
+        // submission, title memory read only where the GPU wrote.
+        const PIECE: usize = 64 << 10;
+        let mut title = vec![0u8; PIECE.min(to - from)];
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut at = from;
+        while at < to {
+            let n = (PIECE - (start + at) % PIECE).min(to - at);
+            // SAFETY: inside the mapping; only the submitting thread
+            // writes it.
+            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+            let old = &mut before[at - from..at - from + n];
+            let title = &mut title[..n];
+            if host != old {
+                // Title threads can write other bytes after this read,
+                // including through an alias. Refresh the page on the
+                // next draw even when every GPU byte was written back.
+                copied[(start + at) / PAGE - start / PAGE] = 0;
+                if !crate::host::read_into((start + at) as *const u8, title) {
+                    at += n;
+                    continue;
+                }
+                // Title memory with the GPU's bytes put in; the copy
+                // takes the title's bytes in turn, and so does the
+                // snapshot: to a later range that overlaps this one,
+                // they are not a shader's write to put back.
+                #[cfg(test)]
+                AFTER_READ.with(|hook| {
+                    if let Some(f) = hook.borrow().as_ref() { f(); }
+                });
+                runs.clear();
+                for (i, ((t, h), o)) in title.iter_mut().zip(host.iter_mut()).zip(old).enumerate() {
+                    if *h != *o && *t != *h {
+                        *t = *h;
+                        match runs.last_mut() {
+                            Some((_, end)) if *end == i => *end += 1,
+                            _ => runs.push((i, i + 1)),
+                        }
+                    }
+                    *h = *t;
+                    *o = *t;
+                }
+                if let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) {
+                    crate::watch::writing(start + at + first, last - first);
+                    written += crate::host::write_changed(start + at, title, &runs);
+                }
+            }
+            at += n;
         }
         written
     }
@@ -602,7 +587,28 @@ mod tests {
         assert_eq!(peek(b + 6), 3, "the title's byte from before");
         // What the shader wrote does go back, in either kind of range.
         assert_eq!((peek(a + 7), peek(b + 9)), (9, 7));
-        assert!(s.before.lock().unwrap().is_none(), "the snapshot is done");
+        assert!(s.before.lock().unwrap().is_empty(), "the snapshot is done");
+    }
+
+    #[test]
+    fn growing_a_sparse_snapshot_only_copies_new_bytes() {
+        let Some((_memory, base, s)) = title() else { return };
+        s.writing(base + 2 * PAGE, 12);
+        let initial = s.before.lock().unwrap()[&(2 * PAGE)].as_ptr();
+        s.writing(base, 8);
+        s.writing(base + 2 * PAGE + 8, 12);
+        s.writing(base, 8);
+        {
+            let chunks = s.before.lock().unwrap();
+            assert_eq!(chunks.values().map(Vec::len).sum::<usize>(), 28);
+            assert_eq!(chunks[&(2 * PAGE)].as_ptr(), initial);
+        }
+        poke(s.data as usize + 2 * PAGE + 13, 3);
+        for (offset, size) in [(0, 8), (2 * PAGE, 12), (2 * PAGE + 8, 12)] {
+            s.copy_back(base + offset, size);
+        }
+        assert_eq!(peek(base + 2 * PAGE + 13), 3);
+        assert!(s.before.lock().unwrap().is_empty());
     }
 
     /// Two declared ranges that overlap: the first one's copy-back gives
