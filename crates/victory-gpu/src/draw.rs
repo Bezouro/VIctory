@@ -86,6 +86,20 @@ pub(crate) struct State {
     /// Root SRVs bound as one-view tables in this list: (host heap, title
     /// address) → dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// Root UAVs keyed by heap, backing resource, byte offset and view size.
+    root_uav_slots: std::collections::HashMap<(usize, usize, u64, u64), u32>,
+}
+
+// Root descriptors carry no size. Bound both the view and shadow synchronisation.
+const ROOT_UAV_BYTES: u64 = 1 << 20;
+
+/// Backing buffer, byte offset and size of a root UAV's raw descriptor.
+fn root_uav_span(address: u64) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    let shadow = crate::shadow::find(address, 4)?;
+    // SAFETY: the shadow retains the buffer enclosing this address.
+    let offset = shadow.gpu(address) - unsafe { shadow.buffer.GetGPUVirtualAddress() };
+    let len = shadow.left(address).min(ROOT_UAV_BYTES) & !3;
+    (offset.is_multiple_of(16) && len != 0).then_some((shadow, offset, len))
 }
 
 impl Drop for State {
@@ -606,6 +620,15 @@ impl State {
                     }
                 }
             }
+            for &(slot, param) in &stage.root_uavs {
+                let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                    Some(&Root::View(address)) => address,
+                    _ => return false,
+                };
+                if !self.root_uav_table(list, address, param, compute) {
+                    return false;
+                }
+            }
             if let Some(param) = stage.stride_table {
                 let gpu = (self.heaps[0] != 0)
                     .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
@@ -624,6 +647,63 @@ impl State {
                     once!("a shader reads the runtime stride table without a host view heap");
                     return false;
                 }
+            }
+        }
+        true
+    }
+
+    fn root_uav_table(
+        &mut self,
+        list: &HostList,
+        address: u64,
+        param: u32,
+        compute: bool,
+    ) -> bool {
+        let Some((heap, host)) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+        else {
+            once!("a root UAV without a bound view heap: the draw is dropped");
+            return false;
+        };
+        // Resolve afresh in case a nested or replacement guest allocation
+        // is now the owner of this address. The descriptor is immutable
+        // while this command list can still refer to it.
+        let Some((shadow, offset, len)) = root_uav_span(address) else {
+            once!(address = format_args!("{address:#x}"), "unsupported root UAV range");
+            return false;
+        };
+        let key = (
+            std::ptr::from_ref(heap) as usize,
+            std::sync::Arc::as_ptr(&shadow) as usize,
+            offset,
+            len,
+        );
+        let index = match self.root_uav_slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let Some(index) = host.dynamic(1) else {
+                    return false;
+                };
+                host.raw_uav_at(index, &shadow.buffer, offset, len);
+                self.dynamic.push((key.0, index, 1));
+                self.root_uav_slots.insert(key, index);
+                index
+            }
+        };
+        shadow.refresh(list, address, len);
+        shadow.gpu_writes(list, address, len);
+        list.buffer_state(&shadow.buffer, crate::host::BUFFER_WRITE);
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
             }
         }
         true
@@ -700,17 +780,25 @@ impl State {
         true
     }
 
-    /// A table UAV covering the requested dword is a candidate, even if
-    /// the shader never reaches a store. This only inspects guest views.
+    /// A table or root UAV covering the requested dword is a candidate, even
+    /// if the shader never reaches a store.
     #[cfg(feature = "diagnostics")]
     fn producer_range(&self) -> Option<(&str, (u64, u64), u64)> {
         let address = crate::producers::word()?;
         let (hash, uavs) = crate::pipeline::compute_uavs(self.pipeline as This)?;
         for u in uavs {
-            let Some(Root::Table(table)) = self.compute.get(usize::from(u.slot)) else { continue };
-            let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4) else { continue };
-            let Some(view) = crate::descriptor::view(handle) else { continue };
-            let Some(range) = crate::descriptor::host::buffer_range(&view) else { continue };
+            let range = match (u.root, self.compute.get(usize::from(u.slot))) {
+                (RootType::Table, Some(Root::Table(table))) => {
+                    let Some(handle) = table.checked_add(u64::from(u.table_offset_dwords) * 4) else { continue };
+                    crate::descriptor::view(handle).and_then(|v| crate::descriptor::host::buffer_range(&v))
+                }
+                (RootType::Descriptor, Some(Root::View(base))) if address >= *base
+                    && address - base < ROOT_UAV_BYTES => {
+                    root_uav_span(*base).map(|(_, _, len)| (*base, len))
+                }
+                _ => None,
+            };
+            let Some(range) = range else { continue };
             if crate::producers::covers(range.0, range.1, address) {
                 return Some((hash, range, address));
             }
@@ -806,7 +894,7 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));

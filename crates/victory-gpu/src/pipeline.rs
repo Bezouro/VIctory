@@ -229,7 +229,8 @@ pub(crate) fn compute_uavs(this: This) -> Option<(&'static str, &'static [victor
             victory_shader::native_programs(c.part(victory_shader::FourCC::DXIL)?.data).ok()
         });
         programs.into_iter().flatten().flat_map(|p| p.used)
-            .filter(|u| u.kind == victory_shader::ResourceType::Uav && u.root == victory_shader::RootType::Table)
+            .filter(|u| u.kind == victory_shader::ResourceType::Uav
+                && matches!(u.root, victory_shader::RootType::Table | victory_shader::RootType::Descriptor))
             .collect()
     });
     Some((&shader.hash, uavs))

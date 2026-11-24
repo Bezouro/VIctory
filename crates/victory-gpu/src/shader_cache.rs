@@ -226,6 +226,9 @@ fn encode(s: &HostShader) -> Vec<u8> {
         for value in [u32::from(r.slot), r.dword, r.byte_offset] { word(&mut out, value); }
     }
     word(&mut out, u32::from(s.stride_table));
+    // Older cache entries end here; no writable root view was expressible.
+    word(&mut out, s.root_uavs.len() as u32);
+    out.extend(&s.root_uavs);
     out
 }
 
@@ -290,6 +293,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         });
     }
     let stride_table = r.word()? != 0;
+    let root_uavs = if r.0.is_empty() { Vec::new() } else { r.list()? };
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -300,6 +304,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         indexed_reads,
         stride_table,
+        root_uavs,
     })
 }
 
@@ -328,6 +333,7 @@ mod tests {
             root_srvs: vec![0, 3],
             indexed_reads: vec![victory_shader::resource::IndexedRead { slot: 1, dword: 2, byte_offset: 32 }],
             stride_table: true,
+            root_uavs: vec![1],
         }
     }
 
@@ -413,6 +419,11 @@ mod tests {
     fn entries_round_trip_and_reject_damage() {
         let bytes = encode(&shader());
         assert_eq!(decode(&bytes), Some(shader()));
+        let mut old = shader();
+        old.root_uavs.clear();
+        // The old VSH2 encoding stopped immediately after the stride flag.
+        let legacy = encode(&old);
+        assert_eq!(decode(&legacy[..legacy.len() - 4]), Some(old));
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);

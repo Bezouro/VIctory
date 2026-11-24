@@ -47,6 +47,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
         indexed_reads: Vec::new(),
         stride_table: lowered.stride_table,
     };
