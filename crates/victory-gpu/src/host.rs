@@ -1130,7 +1130,7 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if crate::producers::word().is_some() {
+            if crate::producers::word().is_some() || crate::producers::mesh_selector().is_some() {
                 // A removed device reports UINT64_MAX as its completed fence.
                 let completed = unsafe { self.fence.GetCompletedValue() };
                 let completed = completed != u64::MAX && completed >= *submitted;

@@ -1,6 +1,8 @@
 //! Observe one exact indirect dispatch X argument across command-list recordings.
 //! A reflected table UAV is a possible destination. Only a change bracketed
 //! by GPU copies around a submitted command proves that its value changed.
+pub(crate) mod batch;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -47,6 +49,7 @@ pub(crate) fn select_mesh(pipeline: crate::object::This, arguments: u64, stride:
         && LEARNED.set(arguments).is_ok()
     {
         tracing::info!(hash, address = format_args!("{arguments:#x}"), "selected terrain indirect X");
+        batch::select(arguments);
     }
 }
 
@@ -68,6 +71,7 @@ pub(crate) fn record_index(base: u64, stride: u32, max: u32, address: u64) -> Op
 
 #[derive(Debug)]
 enum Event {
+    BatchInput(batch::Input),
     Candidate {
         shader: String,
         range: (u64, u64),
@@ -100,6 +104,7 @@ struct Recording {
     events: Vec<Event>,
     omitted: u32,
     pack_inputs: u32,
+    batch_bytes: u64,
 }
 
 #[derive(Default)]
@@ -123,6 +128,7 @@ impl Journal {
         r.events.clear();
         r.omitted = 0;
         r.pack_inputs = 0;
+        r.batch_bytes = 0;
         r.id = 0;
     }
 
@@ -133,6 +139,13 @@ impl Journal {
         if r.events.len() == LIMIT || (pack_input && r.pack_inputs >= 32) {
             r.omitted = r.omitted.saturating_add(1);
             return None;
+        }
+        if let Event::BatchInput(input) = &event {
+            if r.batch_bytes + input.bytes() > batch::BUDGET {
+                r.omitted = r.omitted.saturating_add(1);
+                return None;
+            }
+            r.batch_bytes += input.bytes();
         }
         if r.id == 0 {
             r.id = NEXT_RECORDING.fetch_add(1, Ordering::Relaxed);
@@ -272,7 +285,15 @@ impl Journal {
         if r.events.is_empty() {
             return;
         }
-        let address = word().expect("recorded when enabled");
+        let address = word();
+        if unique_completed {
+            for (order, event) in r.events.iter().enumerate() {
+                if let Event::BatchInput(input) = event {
+                    input.complete(fence, list_index, r.id, order);
+                }
+            }
+        }
+        let Some(address) = address else { return };
         let back = self
             .back
             .get()
@@ -289,6 +310,7 @@ impl Journal {
                     .then(|| unsafe { ptr.cast::<u32>().add(order * 2 + dword).read() })
             };
             match event {
+                Event::BatchInput(_) => {}
                 Event::Candidate {
                     shader,
                     range,

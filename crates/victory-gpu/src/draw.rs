@@ -821,6 +821,61 @@ impl State {
     }
 
     #[cfg(feature = "diagnostics")]
+    fn compute_table_buffer(
+        &self,
+        p: &HostPipeline,
+        kind: ResourceType,
+        register: u32,
+    ) -> Option<(u64, u64)> {
+        let u =
+            p.stages.first()?.translated().used.iter().find(|u| {
+                u.root == RootType::Table && u.kind == kind && u.lower_bound == register
+            })?;
+        let Root::Table(table) = self.compute.get(usize::from(u.slot))? else {
+            return None;
+        };
+        let handle = table.checked_add(u64::from(u.table_offset_dwords) * 4)?;
+        crate::descriptor::host::buffer_range(&crate::descriptor::view(handle)?)
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn sample_batch_input(&self, list: &HostList, p: &HostPipeline, groups: [u32; 3]) {
+        if p.name != "[compute 4fb416369fc50b6e]" || groups[1..] != [1, 1] {
+            return;
+        }
+        let word = crate::producers::word();
+        if word.is_none() && crate::producers::mesh_selector().is_none() {
+            return;
+        }
+        let Some(Root::Constants(c)) = self.compute.get(1) else {
+            return;
+        };
+        let [base, flags, ..] = c.as_slice() else {
+            return;
+        };
+        let range = |kind, register| self.compute_table_buffer(p, kind, register);
+        let Some(out) = range(ResourceType::Uav, 8) else {
+            return;
+        };
+        if word.is_some_and(|x| !crate::producers::covers(out.0, out.1, x)) {
+            return;
+        }
+        if let (Some(records), Some(tiles)) =
+            (range(ResourceType::Srv, 82), range(ResourceType::Srv, 79))
+        {
+            crate::producers::batch::capture(
+                list,
+                records,
+                tiles,
+                out,
+                *base,
+                groups[0],
+                flags & 0x03ff_ffff,
+            );
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
     fn sample_pack_input(&self, list: &HostList, p: &HostPipeline, groups: [u32; 3]) {
         // This layout applies to the identified PackInstances kernel only.
         if p.name != "[compute c1488f485ad606fb]" || groups[1..] != [1, 1] { return; }
@@ -829,13 +884,7 @@ impl State {
         let Some(Root::Constants(c)) = self.compute.get(1) else { return };
         let [items, stride, ..] = c.as_slice() else { return };
         if *stride == 0 { return; }
-        let range = |kind, register| {
-            let u = p.stages.first()?.translated().used.iter().find(|u|
-                u.root == RootType::Table && u.kind == kind && u.lower_bound == register)?;
-            let Root::Table(table) = self.compute.get(usize::from(u.slot))? else { return None };
-            let handle = table.checked_add(u64::from(u.table_offset_dwords) * 4)?;
-            crate::descriptor::host::buffer_range(&crate::descriptor::view(handle)?)
-        };
+        let range = |kind, register| self.compute_table_buffer(p, kind, register);
         let Some(output) = range(ResourceType::Uav, 8) else { return };
         if word.is_some_and(|x| !crate::producers::covers(output.0, output.1, x)) { return; }
         if let Some(source) = range(ResourceType::Srv, 83) {
@@ -880,6 +929,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.sample_pack_input(list, p, [x, y, z]);
+        #[cfg(feature = "diagnostics")]
+        self.sample_batch_input(list, p, [x, y, z]);
         #[cfg(feature = "diagnostics")]
         let query = crate::capture::MeshStats::begin_compute(list, &p.name, Some([x, y, z]));
         #[cfg(feature = "diagnostics")]
