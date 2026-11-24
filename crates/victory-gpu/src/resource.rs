@@ -1012,7 +1012,9 @@ struct Resource {
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet.
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    initial_state: u32,
+    clear_value: Option<[u32; 5]>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1034,7 +1036,7 @@ pub(crate) struct HostTexture {
 /// resource and the state it leaves, if that is a change.
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).host_copy()?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -1048,7 +1050,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host_copy().map(|h| &h.texture)
 }
 
 /// The host texture unordered access views of a title texture name: the
@@ -1064,7 +1066,7 @@ pub(crate) fn host_unordered<'a>(
     if this.is_null() {
         return None;
     }
-    let host = resource(this).host.as_deref()?;
+    let host = resource(this).host_copy()?;
     let Some(twin) = &host.twin else {
         return Some((&host.texture, None));
     };
@@ -1082,7 +1084,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    resource(this).host_copy().cloned()
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -1090,7 +1092,7 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 fn host_texture(
     desc: &ResourceDesc,
     state: u32,
-    clear: *const c_void,
+    clear: Option<[u32; 5]>,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
@@ -1130,9 +1132,7 @@ fn host_texture(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
-        // SAFETY: the title passes a whole clear value.
-        let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
+    let clear_value = clear.map(|mut value| {
         value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
             target_format(value[0])
         } else {
@@ -1145,6 +1145,7 @@ fn host_texture(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
+    tracing::debug!(?d, state, "creating host texture");
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
     let made = unsafe {
@@ -1254,6 +1255,35 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
 }
 
 impl Resource {
+    /// Create the host copy at its first GPU use. The title streams many
+    /// texture descriptions before they are used, often into aliased memory.
+    /// Unused views need no dedicated device memory.
+    fn host_copy(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        self.host.get_or_init(|| {
+            let desc = &self.desc;
+            let state = self.initial_state;
+            let texture = host_texture(desc, state, self.clear_value)?;
+            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+            // Depth and unordered access (see `host_texture`).
+            const BOTH: u32 = 2 | 4;
+            let twin = (desc.flags & BOTH == BOTH)
+                .then(|| host_twin(&texture))
+                .flatten()
+                .map(|texture| {
+                    std::sync::Arc::new(HostTexture {
+                        texture,
+                        state: 0.into(),
+                        twin: None,
+                    })
+                });
+            Some(std::sync::Arc::new(HostTexture {
+                texture,
+                state: state.into(),
+                twin,
+            }))
+        }).as_ref()
+    }
+
     fn data(&self) -> *mut u8 {
         match self.backing {
             Backing::Committed(ref memory) => memory.ptr.as_ptr(),
@@ -1287,33 +1317,19 @@ fn hand_out_resource(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let host = host_texture(&desc, state, clear);
+    let clear_value = (desc.dimension != BUFFER && !clear.is_null()).then(|| {
+        // SAFETY: the caller provides a clear value valid through resource creation.
+        unsafe { clear.cast::<[u32; 5]>().read_unaligned() }
+    });
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
         heap,
         heap_flags,
         backing,
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            // Depth and unordered access (see `host_texture`).
-            const BOTH: u32 = 2 | 4;
-            let twin = (desc.flags & BOTH == BOTH)
-                .then(|| host_twin(&texture))
-                .flatten()
-                .map(|texture| {
-                    std::sync::Arc::new(HostTexture {
-                        texture,
-                        state: 0.into(),
-                        twin: None,
-                    })
-                });
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-                twin,
-            })
-        }),
+        host: std::sync::OnceLock::new(),
+        initial_state: state,
+        clear_value,
     });
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
@@ -1327,7 +1343,8 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get()
+            .and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -1541,7 +1558,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    resource(out).host_copy().is_some().then_some(out)
 }
 
 pub(crate) extern "win64" fn create_placed(
