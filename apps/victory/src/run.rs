@@ -119,6 +119,11 @@ pub fn run(
         println!("not executing (pass --execute to start the title)");
         return Ok(());
     }
+    #[cfg(all(target_os = "linux", feature = "diagnostics"))]
+    if let Some(dir) = std::env::var_os("VICTORY_PREWARM_COMPUTE_DIR") {
+        victory_hle::modules::d3d12x::prewarm_compute_directory(Path::new(&dir))?;
+        victory_loader::linux::signals::reclaim();
+    }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     // Linux timers are fine-grained already.

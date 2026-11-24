@@ -66,11 +66,19 @@ impl Pending {
                 .unwrap_or_default()
                 .as_bytes(),
         );
+        let made = OnceLock::new();
+        #[cfg(all(target_os = "linux", feature = "diagnostics"))]
+        if let [cs] = shaders.as_slice()
+            && cs.stage == "compute"
+            && let Some(pso) = super::prewarm::lookup(cs)
+        {
+            let _ = made.set(Some(pso.clone()));
+        }
         Pending {
             shaders,
             graphics,
             queued: AtomicBool::new(false),
-            made: OnceLock::new(),
+            made,
             wait_lock: Mutex::new(()),
             wait_done: Condvar::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
@@ -347,6 +355,7 @@ fn start(p: &Arc<Pending>) {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    if p.made.get().is_some() { return; }
     if !p.shaders.is_empty() && (focus(p) || super::library::wanted_early(&p.key)) {
         #[cfg(feature = "diagnostics")]
         if super::skipped_shader(&p.shaders).is_some() {

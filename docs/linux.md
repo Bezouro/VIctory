@@ -217,6 +217,14 @@ For a focused capture, add `VICTORY_PREWARM_FIRST=1` to compile matching
 pipelines in creation order ahead of that backlog, including on a cold
 cache. Choose a small set such as the pixel shaders of one material.
 
+On Linux a diagnostics run can prepare native compute shaders from a previous
+capture by setting `VICTORY_PREWARM_COMPUTE_DIR` to a folder of `.compute`
+files produced by `VICTORY_SHADER_SAVE`. Two workers prepare host pipelines
+before the guest starts. Each title PSO whose shader bytes match an accepted
+capture reuses the live host PSO and root signature. The startup log gives
+the number accepted and the elapsed time. This moves compilation into startup
+and retains those PSOs for the run.
+
 `VICTORY_MEASURE_MESH` accepts the same hash format. It records up to 32
 matching mesh draws per command list and reports clipping and pixel shader
 invocations after the submission fence completes. For indirect draws it

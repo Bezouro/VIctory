@@ -569,6 +569,11 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(target_os = "linux", feature = "diagnostics"))]
+mod prewarm;
+#[cfg(all(target_os = "linux", feature = "diagnostics"))]
+pub use prewarm::prewarm_compute_directory;
+
 pub(crate) mod host;
 mod library;
 mod make;

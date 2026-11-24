@@ -5,6 +5,8 @@
 use std::ffi::c_void;
 
 use victory_gpu::device;
+#[cfg(all(target_os = "linux", feature = "diagnostics"))]
+pub use victory_gpu::pipeline::prewarm_compute_directory;
 use victory_gpu::object::{HRESULT, Iid, Object};
 
 use crate::{HleExport, HleModule};

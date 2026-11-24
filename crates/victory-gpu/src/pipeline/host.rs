@@ -286,6 +286,7 @@ pub(crate) fn bounded_root_srvs() -> bool {
 }
 
 /// One stage of a host pipeline and where its bindings go.
+#[derive(Clone)]
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
     /// The root parameter of its user data, and its size in dwords.
@@ -305,6 +306,7 @@ impl Stage {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct HostPipeline {
     /// A compute pipeline (else graphics).
     pub(crate) compute: bool,
