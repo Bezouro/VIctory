@@ -1132,8 +1132,7 @@ mod state {
     }
 }
 
-/// Without a host GPU every draw state call is ignored.
-
+/// Account for every recognized dispatch, including a list without a host.
 fn compute_result(this: This, ran: bool) {
     #[cfg(feature = "diagnostics")]
     crate::validation::compute(ran);
@@ -1196,7 +1195,9 @@ extern "win64" fn execute_indirect(
             count.is_null() || counter.is_some()
         ));
     }
-    if matches!(args, [[2 | 105, ..]]) {
+    // A signature can set root arguments before its terminal dispatch.
+    // Count a rejected composite signature as one discarded dispatch call.
+    if matches!(args.last(), Some([2 | 105, ..])) {
         compute_result(this, ran);
     }
     if ran {

@@ -1,16 +1,16 @@
 //! Graphics pipelines are made by workers. On Linux a compute dispatch can
-//! claim its own compilation when no worker has finished it. Translating a shader and the host driver's
+//! claim or join its own compilation. Translating a shader and the host driver's
 //! compile take from milliseconds to seconds each, and a title's first world
 //! frame can request over 1,200 new pipelines: making them synchronously on
 //! recording threads stalls the frame for tens of seconds and can trigger a
 //! GPU watchdog timeout (decision 0007, "Pipelines made off the title's
 //! threads").
 //!
-//! A first use queues the pipeline and waits for it within an atomic per-frame
+//! A budgeted first use queues the pipeline and waits within an atomic per-frame
 //! budget shared across all recording threads, so cheap or one-off passes
 //! during startup/warmup are ready immediately while steady-state frames stay
 //! responsive without multi-hundred-millisecond freezes. Past the budget, a
-//! draw or dispatch whose pipeline is not ready is dropped while the worker
+//! command using the budget policy is dropped while the worker
 //! finishes compiling it in the background.
 //!
 //! By default the budget is adaptive: [`WARMUP_BUDGET_MS`] (500 ms) during

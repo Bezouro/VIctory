@@ -238,6 +238,7 @@ such as the inputs to later indirect mesh draws. Diagnostics can reproduce the p
 `VICTORY_TRACE_COMPUTE` takes comma-separated shader hashes. The diagnostics
 log includes root constants, buffer views and the GPU's compute invocation
 count after submission. Mesh and compute queries share 32 entries per list.
+Run per-mesh sampling separately from full render validation, which uses the same query type for each draw.
 
 With `VICTORY_VALIDATE=1`, each present logs cumulative counts of compute
 calls requested and discarded, pipeline objects ready at first guest bind,

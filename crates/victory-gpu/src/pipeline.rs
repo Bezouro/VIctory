@@ -241,6 +241,13 @@ pub(crate) fn measured_mesh(this: This) -> Option<String> {
         parse_shader_hashes(&std::env::var("VICTORY_MEASURE_MESH").unwrap_or_default())
     });
     if hashes.is_empty() || this.is_null() { return None; }
+    // Both diagnostics use the same D3D12 query type. One command can
+    // have only one active query of that type on the command list.
+    if crate::validation::enabled() {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| tracing::warn!("render validation owns mesh statistics queries; use a separate run for per-mesh samples"));
+        return None;
+    }
     let stages = &pipeline(this).shaders;
     stages.iter().any(|s| hashes.contains(&s.hash)).then(|| format!("{stages:?}"))
 }
@@ -709,3 +716,6 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod depth_bounds_test;
+
+#[cfg(all(test, target_os = "linux"))]
+mod compute_dispatch_test;
