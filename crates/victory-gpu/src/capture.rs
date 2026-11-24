@@ -368,7 +368,7 @@ pub(crate) struct PassImage {
     name: String,
     buffer: ID3D12Resource,
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    rg16_float: bool,
+    float_target: Option<FloatTarget>,
     saved: bool,
 }
 
@@ -378,9 +378,9 @@ impl PassImage {
         let target = target as crate::object::This;
         let texture = crate::resource::host_resource(target)?;
         let desc = unsafe { texture.GetDesc() };
-        let rg16_float = desc.Format.0 == 34 || (desc.Format.0 == 33 && view_format == Some(34));
+        let float_target = FloatTarget::from_formats(desc.Format.0, view_format);
         if desc.SampleDesc.Count != 1 || desc.MipLevels != 1 || desc.DepthOrArraySize != 1
-            || (!rg16_float && !matches!(desc.Format.0, 23..=25 | 27..=29 | 87 | 90 | 91))
+            || (float_target.is_none() && !matches!(desc.Format.0, 23..=25 | 27..=29 | 87 | 90 | 91))
         {
             return None;
         }
@@ -390,7 +390,7 @@ impl PassImage {
         crate::list::ensure_state(list, target, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
         let (buffer, footprint) = read?;
         let name = format!("pass-{hash}-{occurrence}-slot-{slot}-{}x{}-f{}", desc.Width, desc.Height, desc.Format.0);
-        Some(Self { name, buffer, footprint, rg16_float, saved: false })
+        Some(Self { name, buffer, footprint, float_target, saved: false })
     }
 
     pub(crate) fn save_once(&mut self) {
@@ -399,17 +399,25 @@ impl PassImage {
         let f = self.footprint.Footprint;
         let packed = matches!(f.Format.0, 23..=25);
         let bgra = matches!(f.Format.0, 87 | 90 | 91);
+        let float_target = self.float_target;
+        let row_bytes = f.Width as usize * float_target.map_or(4, |target| target.bytes_per_pixel as usize);
         let mut data = std::ptr::null_mut();
-        // SAFETY: the command list completed. The footprint describes rows of
-        // the one 32-bit colour subresource copied to this readback buffer.
+        // SAFETY: the command list completed. Each row of the readback
+        // footprint contains at least row_bytes of color data.
         let raw = unsafe {
             if self.buffer.Map(0, None, Some(&mut data)).is_err() { return; }
-            let mut raw = Vec::with_capacity((f.Width as usize * if packed { 8 } else { 4 } + 1) * f.Height as usize);
-            if self.rg16_float { rg16_dds_header(&mut raw, f.Width, f.Height); }
+            let mut raw = Vec::new();
+            if let Some(target) = float_target {
+                target.dds_header(&mut raw, f.Width, f.Height);
+                raw.reserve(row_bytes * f.Height as usize);
+            } else {
+                let pixel_bytes = if packed { 8 } else { 4 };
+                raw.reserve((f.Width as usize * pixel_bytes + 1) * f.Height as usize);
+            }
             let start = data.cast::<u8>().add(self.footprint.Offset as usize);
             for y in 0..f.Height as usize {
-                if !self.rg16_float { raw.push(0); }
-                let row = std::slice::from_raw_parts(start.add(y * f.RowPitch as usize), f.Width as usize * 4);
+                if float_target.is_none() { raw.push(0); }
+                let row = std::slice::from_raw_parts(start.add(y * f.RowPitch as usize), row_bytes);
                 if packed {
                     for pixel in row.chunks_exact(4) {
                         let word = u32::from_le_bytes(pixel.try_into().unwrap());
@@ -428,7 +436,7 @@ impl PassImage {
             self.buffer.Unmap(0, None);
             raw
         };
-        let (extension, bytes) = if self.rg16_float {
+        let (extension, bytes) = if float_target.is_some() {
             ("dds", raw)
         } else {
             let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -447,15 +455,39 @@ impl PassImage {
     }
 }
 
-/// DDS with a DX10 header keeps the two binary16 channels bit for bit.
-fn rg16_dds_header(bytes: &mut Vec<u8>, width: u32, height: u32) {
-    bytes.extend_from_slice(b"DDS ");
-    let dimensions = [124, 0x100f, height, width, width * 4, 0, 0];
-    let pixel_format = [32, 4, u32::from_le_bytes(*b"DX10"), 0, 0, 0, 0, 0];
-    let texture_caps = [0x1000, 0, 0, 0, 0];
-    let dx10 = [34, 3, 0, 1, 0]; // R16G16_FLOAT, TEXTURE2D, one array element.
-    for field in dimensions.into_iter().chain([0; 11]).chain(pixel_format).chain(texture_caps).chain(dx10) {
-        bytes.extend_from_slice(&field.to_le_bytes());
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FloatTarget {
+    format: u32,
+    bytes_per_pixel: u32,
+}
+
+impl FloatTarget {
+    fn from_formats(resource: i32, view: Option<i32>) -> Option<Self> {
+        let format = match (resource, view) {
+            (9, Some(10)) | (10, _) => 10, // RGBA16_FLOAT
+            (33, Some(34)) | (34, _) => 34, // RG16_FLOAT
+            (39, Some(41)) | (41, _) => 41, // R32_FLOAT
+            (53, Some(54)) | (54, _) => 54, // R16_FLOAT
+            _ => return None,
+        };
+        let bytes_per_pixel = match format {
+            10 => 8,
+            54 => 2,
+            _ => 4,
+        };
+        Some(Self { format, bytes_per_pixel })
+    }
+
+    /// DDS with a DX10 header preserves every channel's stored bits.
+    fn dds_header(self, bytes: &mut Vec<u8>, width: u32, height: u32) {
+        bytes.extend_from_slice(b"DDS ");
+        let dimensions = [124, 0x100f, height, width, width * self.bytes_per_pixel, 0, 0];
+        let pixel_format = [32, 4, u32::from_le_bytes(*b"DX10"), 0, 0, 0, 0, 0];
+        let texture_caps = [0x1000, 0, 0, 0, 0];
+        let dx10 = [self.format, 3, 0, 1, 0]; // TEXTURE2D, one array element.
+        for field in dimensions.into_iter().chain([0; 11]).chain(pixel_format).chain(texture_caps).chain(dx10) {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
     }
 }
 
@@ -1038,16 +1070,23 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn rg16_dds_declares_unpadded_rows_and_two_half_float_channels() {
-        let mut header = Vec::new();
-        super::rg16_dds_header(&mut header, 7, 3);
-        assert_eq!(header.len(), 148);
-        assert_eq!(&header[0..4], b"DDS ");
-        let field = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
-        assert_eq!((field(4), field(12), field(16), field(20)), (124, 3, 7, 28));
-        assert_eq!(field(76), 32);
-        assert_eq!(&header[84..88], b"DX10");
-        assert_eq!((field(128), field(132), field(140)), (34, 3, 1));
+    fn float_dds_declares_the_typed_format_and_unpadded_rows() {
+        use super::FloatTarget;
+        for (typeless, typed, row_bytes) in [(9, 10, 56), (33, 34, 28), (39, 41, 28), (53, 54, 14)] {
+            assert!(FloatTarget::from_formats(typeless, None).is_none());
+            assert!(FloatTarget::from_formats(typeless, Some(28)).is_none());
+            let target = FloatTarget::from_formats(typeless, Some(typed)).unwrap();
+            assert_eq!(FloatTarget::from_formats(typed, None), Some(target));
+            let mut header = Vec::new();
+            target.dds_header(&mut header, 7, 3);
+            assert_eq!(header.len(), 148);
+            assert_eq!(&header[0..4], b"DDS ");
+            let field = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
+            assert_eq!((field(4), field(12), field(16), field(20)), (124, 3, 7, row_bytes));
+            assert_eq!(field(76), 32);
+            assert_eq!(&header[84..88], b"DX10");
+            assert_eq!((field(128), field(132), field(140)), (typed as u32, 3, 1));
+        }
     }
 
     #[test]
