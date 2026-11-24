@@ -219,6 +219,17 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    run_raw_uav_cases(shader, cases, 1, |label, index, inputs, out| {
+        check(label, index, inputs, out[0]);
+    });
+}
+
+fn run_raw_uav_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    output_dwords: u32,
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
     // One test at a time: with these tests on the hardware adapter and WARP
     // from several test threads at once, now and then none of their
     // dispatches ever completes and the test binary hangs.
@@ -248,13 +259,13 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(output_dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, &out[0]);
         }
         ran += 1;
     }
@@ -763,18 +774,90 @@ fn root_srv_loads_past_the_length_the_host_passes_read_zero() {
 
     let data: Vec<u32> = (0..32u32).map(|i| 0x1000 + i).collect();
     let cases = [(8, 0x1002), (124, 0x101F), (128, 0), (0x7FFF_FFFC, 0), (0xFFFF_FFFC, 0)];
+    check_root_buffer_reads(&shader, &data, data.len() as u32 * 4, &cases);
+}
+
+#[test]
+fn unsigned_halfword_load_preserves_bits_at_each_byte_position() {
+    let body = [
+        s_mov_b32(12, 6),
+        s_mov_b32(13, 7),
+        s_mov_b32(14, 0xC1),
+        s_mov_b32(15, 0xFF),
+        0x1101_4FAC,
+        0xE028_1000,
+        0x8003_0001, // buffer_load_ushort v0, v1, s[12:15], 0 offen
+    ];
+    let shader = build_cs(&body, true);
+    let words = [0xc384_42ff, 0xf7aa_5511];
+    let cases = [
+        (0, 0x42ff),
+        (1, 0x8442),
+        (2, 0xc384),
+        (3, 0x11c3),
+        (6, 0xf7aa),
+        (7, 0),
+        (8, 0),
+        (0x7fff_ffef, 0),
+        (u32::MAX, 0),
+    ];
+    check_root_buffer_reads(&shader, &words, 8, &cases);
+    // The host can expose a root view ending halfway through a dword.
+    check_root_buffer_reads(&shader, &words, 6, &[(3, 0x11c3), (4, 0x5511), (5, 0)]);
+    let mut biased = body;
+    biased[5] |= 1;
+    let shader = build_cs(&biased, true);
+    check_root_buffer_reads(&shader, &words, 8, &[(0, 0x8442), (u32::MAX, 0)]);
+}
+
+#[test]
+fn short_stores_preserve_neighboring_bytes_and_drop_out_of_bounds_writes() {
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend(s_load_dwordx4(8, 4));
+    for i in 0..4u8 {
+        words.push(vop1(0x001, i + 1, sgpr(i)));
+    }
+    words.extend(buffer_store_dword(3, 8, 0));
+    words.extend(buffer_store_dword(4, 8, 4));
+    // buffer_store_short v2, v1, s[8:11], 0 offen offset:1
+    words.extend([0xE068_1001, 0x8002_0201]);
+    words.push(S_ENDPGM);
+
+    let a = 0x44332211;
+    let b = 0x88776655;
+    let store = 0xdead_bbaa;
+    let cases = [0, 1, 2, 3, 5, 6, 7, u32::MAX - 1, u32::MAX].map(|offset| [offset, store, a, b]);
+    let expected = [
+        [0x44bbaa11, b],
+        [0xbbaa2211, b],
+        [0xaa332211, 0x887766bb],
+        [a, 0x8877bbaa],
+        [a, 0xbbaa6655],
+        [a, b],
+        [a, b],
+        [a, b],
+        [a, b],
+    ];
+    let shader = lower_cs(&words, false);
+    run_raw_uav_cases(&shader, &cases, 2, |backend, i, input, out| {
+        assert_eq!(out, expected[i], "{backend}: offset {:#x} plus 1", input[0]);
+    });
+}
+
+fn check_root_buffer_reads(shader: &HostShader, data: &[u32], len: u32, cases: &[(u32, u32)]) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 device; skipped");
         return;
     };
-    let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
-    for (offset, want) in cases {
+    let (root, pso) = host.compute_pipeline(shader).expect("compute pipeline");
+    for &(offset, want) in cases {
         let mut ud = vec![0u32; shader.user_data_dwords() as usize];
         for u in &shader.user_data {
             ud[u.index as usize] = match u.root {
                 RootType::Constants => [offset, 0, 0, 0][u.dword as usize],
                 RootType::Table => 0,
-                RootType::Descriptor => 4 * data.len() as u32,
+                RootType::Descriptor => len,
                 other => super::host::guard(other, 1, 0)
                     .unwrap_or_else(|| panic!("unexpected user data {other:?}")),
             };
@@ -786,7 +869,13 @@ fn root_srv_loads_past_the_length_the_host_passes_read_zero() {
                 &Dispatch {
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: data.clone() }),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: data.to_vec(),
+                            },
+                        ),
                     ],
                     views: &[View::RawUav(1)],
                     samplers: &[],

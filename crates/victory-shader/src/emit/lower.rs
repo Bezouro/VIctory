@@ -4175,14 +4175,14 @@ impl<'a> Lower<'a> {
     /// descriptors built around one have no record limit (Grand Theft Auto
     /// VI's mesh programs fetch vertices that way, at indices from data).
     /// So through a root SRV, a load whose dwords are not all within the
-    /// length the host passes ([`Self::root_srv_len`]) reads offset 0 and
+    /// length the host passes ([`Self::root_view_len`]) reads offset 0 and
     /// returns 0, as a view's bounds would.
     fn raw_load(&mut self, h: V, at: V, n: u32) -> Vec<V> {
         let c = self.cur;
         let slot = self.s.root_srvs.iter().find(|r| r.1 == h).map(|r| r.0);
         let (at, ok) = match slot {
             Some(slot) => {
-                let len = self.root_srv_len(slot);
+                let len = self.root_view_len(slot);
                 let need = self.s.m.i32(4 * n);
                 // at + 4n <= len, without wrapping.
                 let room = self.s.m.bin(c, Bin::Sub, len, need);
@@ -4227,18 +4227,18 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, big, k, at)
     }
 
-    /// The bytes the host's root SRV of root parameter `slot` holds from
+    /// The bytes the host's raw root view of root parameter `slot` holds from
     /// its address on: a user-data dword at the parameter's own index (a
     /// root descriptor's dwords hold no constants), as [`UserData`] with
     /// [`RootType::Descriptor`] lists it.
-    fn root_srv_len(&mut self, slot: u8) -> V {
+    fn root_view_len(&mut self, slot: u8) -> V {
         let param = self
             .x
             .native
             .layout
             .iter()
             .position(|rp| rp.root == RootType::Descriptor && rp.slot == slot)
-            .expect("a root SRV's parameter");
+            .expect("a root view's parameter");
         let rp = self.x.native.layout[param];
         let index = u32::from(rp.user_data);
         self.user_reads.insert(
@@ -7951,6 +7951,233 @@ impl<'a> Lower<'a> {
         })
     }
 
+    fn buffer_short(
+        &mut self,
+        inst: &Inst,
+        site: Site,
+        src: &Source,
+        off: V,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let Fields::Buffer { data, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let Some(Operand::Vector { reg, .. }) = *data else {
+            return Err("a halfword buffer operand");
+        };
+        let store = inst.name() == "buffer_store_short";
+        let kind = self.used_kind(src).map(|u| u.kind);
+        let cbv = kind == Some(ResourceType::Cbv);
+        let props = if cbv && !store {
+            (13, 0x1_0000)
+        } else if store || kind == Some(ResourceType::Uav) {
+            (11 | 0x1000, 0)
+        } else {
+            (11, 0)
+        };
+        let h = self.handle(site, src, false, props)?;
+        let value = if store {
+            Some(self.vgprs(inst, data.as_ref().unwrap(), 1)?[0])
+        } else {
+            None
+        };
+        let access = self.begin_guarded(guard);
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let len = if cbv {
+            self.s.m.i32(0x1_0000)
+        } else if let Some(slot) = self
+            .s
+            .root_srvs
+            .iter()
+            .chain(&self.s.root_uavs)
+            .find(|r| r.1 == h)
+            .map(|r| r.0)
+        {
+            self.root_view_len(slot)
+        } else {
+            let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+            let mip = self.s.m.undef(i32t);
+            let d = self
+                .s
+                .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+            self.s.m.extract(c, d, 0)
+        };
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let two = self.s.m.i32(2);
+        let end = self.s.m.bin(c, Bin::Add, off, two);
+        let limit = self.s.m.i32(RAW_OFFSET_MAX);
+        let no_wrap = self.s.m.cmp(c, pred::IULE, end, limit);
+        // Raw loads use aligned halfwords. An odd store touches its containing
+        // dword(s) via atomics. A root view needs room for those accesses too.
+        let parity = self.s.m.bin(c, Bin::And, off, one);
+        let accessed_end = if cbv || store {
+            let three = self.s.m.i32(3);
+            let aligned = self.s.m.i32(!3);
+            let padded = self.s.m.bin(c, Bin::Add, end, three);
+            let dword_end = self.s.m.bin(c, Bin::And, padded, aligned);
+            if store {
+                let odd = self.s.m.cmp(c, pred::NE, parity, zero);
+                self.s.m.select(c, odd, dword_end, end)
+            } else {
+                dword_end
+            }
+        } else {
+            self.s.m.bin(c, Bin::Add, end, parity)
+        };
+        let fits = self.s.m.cmp(c, pred::IULE, accessed_end, len);
+        let in_bounds = self.s.m.bin(c, Bin::And, no_wrap, fits);
+        // Offsets are accumulated with saturation before entry, so end cannot wrap.
+        let at = self.begin_guarded(Some(in_bounds));
+        if let Some(value) = value {
+            self.store_buffer_short(h, off, value);
+            self.end_guarded(at, &[]);
+            self.end_guarded(access, &[]);
+        } else {
+            let value = self.load_buffer_short(h, off, cbv);
+            let value = self.end_guarded(at, &[(value, zero)])[0];
+            let value = self.end_guarded(access, &[(value, zero)])[0];
+            self.write(inst, Reg::V(reg), value, guard);
+        }
+        Ok(())
+    }
+
+    fn load_buffer_short(&mut self, h: V, off: V, cbv: bool) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let one = self.s.m.i32(1);
+        let three = self.s.m.i32(3);
+        let lane_mask = self.s.m.i32(if cbv { 3 } else { 1 });
+        let align = self.s.m.i32(if cbv { !3 } else { !1 });
+        let mask = self.s.m.i32(0xff);
+        let next = self.s.m.bin(c, Bin::Add, off, one);
+        let mut read_byte = |address| {
+            let at = self.s.m.bin(c, Bin::And, address, align);
+            let word = if cbv {
+                self.cbuffer_dword(h, at)
+            } else {
+                self.s.flags |= flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION;
+                let i16t = self.s.m.int(16);
+                let ty = self
+                    .s
+                    .m
+                    .named_struct("dx.types.ResRet.i16", vec![i16t, i16t, i16t, i16t, i32t]);
+                let iu = self.s.m.undef(i32t);
+                let mask = self.s.m.i8(1);
+                let align = self.s.m.i32(2);
+                let raw = self.s.op(
+                    c,
+                    "rawBufferLoad.i16",
+                    Attr::ReadOnly,
+                    ty,
+                    139,
+                    &[h, at, iu, mask, align],
+                );
+                let short = self.s.m.extract(c, raw, 0);
+                self.s.m.cast(c, Cast::ZExt, short, i32t)
+            };
+            let lane = self.s.m.bin(c, Bin::And, address, lane_mask);
+            let shift = self.s.m.bin(c, Bin::Shl, lane, three);
+            let part = self.s.m.bin(c, Bin::LShr, word, shift);
+            self.s.m.bin(c, Bin::And, part, mask)
+        };
+        let lo = read_byte(off);
+        let hi = read_byte(next);
+        let eight = self.s.m.i32(8);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, eight);
+        self.s.m.bin(c, Bin::Or, lo, hi)
+    }
+
+    fn store_buffer_short(&mut self, h: V, off: V, value: V) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let void = self.s.t.void;
+        let iu = self.s.m.undef(i32t);
+        let zero = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let parity = self.s.m.bin(c, Bin::And, off, one);
+        let even = self.s.m.cmp(c, pred::EQ, parity, zero);
+        let (aligned, unaligned, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s
+            .m
+            .terminate(c, Term::CondBr(even, aligned, unaligned));
+
+        self.s.flags |= flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION;
+        let i16t = self.s.m.int(16);
+        let v16 = self.s.m.cast(aligned, Cast::Trunc, value, i16t);
+        let undef = self.s.m.undef(i16t);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(2);
+        self.s.op(
+            aligned,
+            "rawBufferStore.i16",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[h, off, iu, v16, undef, undef, undef, mask, align],
+        );
+        self.s.m.terminate(aligned, Term::Br(join));
+
+        // An unaligned short can cross a dword. Update each byte through
+        // masked atomics, preserving bytes outside the store.
+        let c = unaligned;
+        let ff = self.s.m.i32(0xff);
+        let all = self.s.m.i32(u32::MAX);
+        let and = self.s.m.i32(1);
+        let or = self.s.m.i32(2);
+        let three = self.s.m.i32(3);
+        let align = self.s.m.i32(!3);
+        let eight = self.s.m.i32(8);
+        let hi = self.s.m.bin(c, Bin::LShr, value, eight);
+        let next = self.s.m.bin(c, Bin::Add, off, one);
+        for (addr, part) in [(off, value), (next, hi)] {
+            let dword = self.s.m.bin(c, Bin::And, addr, align);
+            let lane = self.s.m.bin(c, Bin::And, addr, three);
+            let shift = self.s.m.bin(c, Bin::Shl, lane, three);
+            let mask = self.s.m.bin(c, Bin::Shl, ff, shift);
+            let preserve = self.s.m.bin(c, Bin::Xor, mask, all);
+            let part = self.s.m.bin(c, Bin::And, part, ff);
+            let part = self.s.m.bin(c, Bin::Shl, part, shift);
+            self.s.op(
+                c,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                78,
+                &[h, and, dword, iu, iu, preserve],
+            );
+            self.s.op(
+                c,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                78,
+                &[h, or, dword, iu, iu, part],
+            );
+        }
+        self.s.m.terminate(c, Term::Br(join));
+        self.cur = join;
+    }
+
+    /// Add unsigned address terms without wrapping into a valid raw offset.
+    fn buffer_offset_add(&mut self, a: V, b: V, checked: bool) -> V {
+        let c = self.cur;
+        let sum = self.s.m.bin(c, Bin::Add, a, b);
+        if !checked {
+            return sum;
+        }
+        let limit = self.s.m.i32(RAW_OFFSET_MAX);
+        let wrap = self.s.m.cmp(c, pred::IULT, sum, a);
+        let big = self.s.m.cmp(c, pred::IUGT, sum, limit);
+        let invalid = self.s.m.bin(c, Bin::Or, wrap, big);
+        self.s.m.select(c, invalid, limit, sum)
+    }
+
     fn buffer(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
         let Fields::Buffer {
             data,
@@ -7996,6 +8223,7 @@ impl<'a> Lower<'a> {
         };
         // d16: two 16-bit channels per VGPR, low half first (buffer and
         // tbuffer formats alike).
+        let halfword = matches!(name, "buffer_load_ushort" | "buffer_store_short");
         let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
@@ -8004,6 +8232,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() => (false, 1),
+            _ if halfword && !*idxen => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -8025,14 +8254,14 @@ impl<'a> Lower<'a> {
         let mut off = self.s.m.i32(u32::from(*offset));
         if *offen {
             let o = vaddr(self, u8::from(*idxen))?;
-            off = self.s.m.bin(c, Bin::Add, off, o);
+            off = self.buffer_offset_add(off, o, halfword);
         }
         if !matches!(
             soffset,
             Operand::Scalar { code: NULL, .. } | Operand::Const(128)
         ) {
             let so = self.operand(inst, soffset)?;
-            off = self.s.m.bin(c, Bin::Add, off, so);
+            off = self.buffer_offset_add(off, so, halfword);
         }
         let src = self
             .descriptors
@@ -8043,10 +8272,13 @@ impl<'a> Lower<'a> {
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
-            off = self.s.m.bin(c, Bin::Add, off, b);
+            off = self.buffer_offset_add(off, b, halfword);
         }
         if let Some(x) = extra {
-            off = self.s.m.bin(c, Bin::Add, off, x);
+            off = self.buffer_offset_add(off, x, halfword);
+        }
+        if halfword {
+            return self.buffer_short(inst, site, src, off, guard);
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
             // A constant buffer read per lane (a dynamically indexed array).
