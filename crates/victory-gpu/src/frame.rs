@@ -126,15 +126,21 @@ pub(crate) extern "win64" fn wait(
     token: *mut u64,
 ) -> HRESULT {
     let origin = kind == ORIGIN;
-    let (tick, wait) = next_tick(kind);
+    let started = Instant::now();
     let limit = Duration::from_millis(u64::from(timeout_ms));
-    let hr = if wait > limit {
-        std::thread::sleep(limit);
-        TIMEOUT
-    } else {
+    let (hr, _tick) = loop {
+        let (tick, wait) = next_tick(kind);
+        let remaining = limit.saturating_sub(started.elapsed());
+        if wait > remaining {
+            std::thread::sleep(remaining);
+            break (TIMEOUT, tick);
+        }
         std::thread::sleep(wait);
-        last(kind).fetch_max(tick, Ordering::Relaxed);
-        S_OK
+        // If a concurrent waiter claimed this tick, try the next one within
+        // the original timeout.
+        if last(kind).fetch_max(tick, Ordering::Relaxed) < tick {
+            break (S_OK, tick);
+        }
     };
     // A frame begun on a time-out takes no tick: its flip still does.
     if origin && (hr == S_OK || flags & TOKEN_ON_TIMEOUT != 0) {
@@ -151,8 +157,8 @@ pub(crate) extern "win64" fn wait(
         timeout_ms,
         flags,
         hr,
-        tick,
-        wait_us = wait.as_micros() as u64,
+        tick = _tick,
+        wait_us = started.elapsed().as_micros() as u64,
         frame = current(),
         "frame wait"
     );
@@ -222,5 +228,26 @@ mod tests {
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
+
+        // Two simultaneous waits have time for the first tick (200 ms),
+        // but must not both consume it or extend the deadline to the next.
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let wait_for_flip = || {
+                let null = std::ptr::null();
+                if barrier.wait().is_leader() {
+                    assert_eq!(set_interval(null, null, 200_000, 1, 0), S_OK);
+                }
+                barrier.wait();
+                wait(null, FLIP, 285, std::ptr::null(), 0, std::ptr::null_mut())
+            };
+            let first = scope.spawn(wait_for_flip);
+            let second = scope.spawn(wait_for_flip);
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert!(
+            results.contains(&S_OK) && results.contains(&TIMEOUT),
+            "{results:?}"
+        );
     }
 }
