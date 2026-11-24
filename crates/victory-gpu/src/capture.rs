@@ -122,9 +122,40 @@ pub(crate) fn note_busy(frame: u64, ran: u64) {
     }
 }
 
+// Frame numbering varies with loading time. Anchor a short sequence of
+// real presents to the first recorded draw that uses the selected shader.
+static SHADER_FRAMES: std::sync::OnceLock<std::ops::Range<u64>> = std::sync::OnceLock::new();
+
+pub(crate) fn note_shader(pipeline: crate::object::This) {
+    static SETTING: std::sync::OnceLock<Option<(String, u64)>> = std::sync::OnceLock::new();
+    if SHADER_FRAMES.get().is_some() {
+        return;
+    }
+    let Some((hash, count)) = SETTING.get_or_init(|| {
+        folder()?;
+        let value = std::env::var("VICTORY_CAPTURE_FROM_SHADER").ok()?;
+        let (hash, count) = value.split_once(',').unwrap_or((&value, "8"));
+        let mut hashes = crate::pipeline::parse_shader_hashes(hash);
+        Some((hashes.pop()?, count.trim().parse::<u64>().ok()?.clamp(1, 64)))
+    }) else {
+        return;
+    };
+    if crate::pipeline::has_shader(pipeline, hash) {
+        let first = crate::queue::presented() + 1;
+        let end = first.saturating_add(*count);
+        if SHADER_FRAMES.set(first..end).is_ok() {
+            tracing::info!(hash, first, count, "capturing presented frames after matching draw");
+        }
+    }
+}
+
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n) || n == SCENE_CAPTURE.load(std::sync::atomic::Ordering::Relaxed))
+    folder().is_some()
+        && (n.is_power_of_two()
+            || listed(n)
+            || n == SCENE_CAPTURE.load(std::sync::atomic::Ordering::Relaxed)
+            || SHADER_FRAMES.get().is_some_and(|frames| frames.contains(&n)))
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.

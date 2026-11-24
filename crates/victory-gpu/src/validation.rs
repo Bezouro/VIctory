@@ -94,6 +94,7 @@ impl Draws {
 
     pub(crate) fn end(list: &HostList, query: Option<u32>, pipeline: crate::object::This, targets: &[usize], view_formats: &[i32]) {
         if !enabled() { return; }
+        crate::capture::note_shader(pipeline);
         let mut d = list.validation.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(index) = query {
             let (heap, _) = d.pages[(index / PAGE) as usize].as_ref().expect("started query");

@@ -209,6 +209,12 @@ matching internal textures on the frame following the first qualifying workload.
 Use `VICTORY_DUMP_TARGETS=1` for all sizes. Leave `VICTORY_SCENE_EXTENT` and
 `VICTORY_SHOW_TARGET` unset for this comparison.
 
+For frame sequences whose numbers vary between replays, set
+`VICTORY_VALIDATE=1` and `VICTORY_CAPTURE_FROM_SHADER=<hash>,8`.
+The first recorded draw using the selected shader starts the sequence.
+This setting captures presented frames. Internal targets can be captured
+independently with `VICTORY_COMPARE_PASSES`.
+
 In a diagnostics build, `VICTORY_SCENE_EXTENT=1280x720` presents the last
 single-sample RGBA8 or BGRA8 target of that size as the scene and composites
 the remaining presentation planes over it. For a title rendering internally
