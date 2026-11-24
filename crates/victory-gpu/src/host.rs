@@ -932,6 +932,7 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    packed_light_sources: std::collections::HashMap<usize, usize>,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -1688,6 +1689,31 @@ impl HostList {
 
     /// Notes that the list has `copy` in `wanted` from here on: the state it
     /// leaves, if that is a change (none on the list's first use).
+    pub(crate) fn new_packed_light_pair(&self, dst: &HostCopy, src: &HostCopy) -> bool {
+        let src = std::sync::Arc::as_ptr(src) as usize;
+        self.deferred()
+            .packed_light_sources
+            .insert(std::sync::Arc::as_ptr(dst) as usize, src)
+            != Some(src)
+    }
+
+    pub(crate) fn copy_state(&self, copy: &HostCopy, wanted: u32) {
+        if let Some(barrier) = self.move_to(copy, wanted) {
+            // SAFETY: an open list. Its state tracker retains the texture.
+            unsafe {
+                self.list.ResourceBarrier(&[barrier]);
+            }
+        }
+    }
+
+    pub(crate) fn recorded_texture_state(&self, copy: &HostCopy) -> Option<u32> {
+        self.states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(std::sync::Arc::as_ptr(copy) as usize))
+            .map(|(_, last, _)| *last)
+    }
+
     fn track(&self, copy: &HostCopy, wanted: u32) -> Option<u32> {
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(copy) as usize) {

@@ -1012,7 +1012,8 @@ struct Resource {
     backing: Backing,
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet.
-    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    host: HostSlot,
+    packed_source: Option<std::sync::Arc<HostSlot>>,
     initial_state: u32,
     clear_value: Option<[u32; 5]>,
 }
@@ -1024,6 +1025,7 @@ struct Resource {
 /// (console memory outlives the object; a host texture must outlive the
 /// lists that name it).
 pub(crate) struct HostTexture {
+    pub(crate) lighting_layout: std::sync::OnceLock<Option<crate::texture::lighting::Layout>>,
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
     /// A depth target's twin for unordered access ([`host_twin`]), which
@@ -1278,29 +1280,13 @@ impl Resource {
     /// texture descriptions before they are used, often into aliased memory.
     /// Unused views need no dedicated device memory.
     fn host_copy(&self) -> Option<&std::sync::Arc<HostTexture>> {
-        self.host.get_or_init(|| {
-            let desc = &self.desc;
-            let state = self.initial_state;
-            let texture = host_texture(desc, state, self.clear_value)?;
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            // Depth and unordered access (see `host_texture`).
-            const BOTH: u32 = 2 | 4;
-            let twin = (desc.flags & BOTH == BOTH)
-                .then(|| host_twin(&texture))
-                .flatten()
-                .map(|texture| {
-                    std::sync::Arc::new(HostTexture {
-                        texture,
-                        state: 0.into(),
-                        twin: None,
-                    })
-                });
-            Some(std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-                twin,
-            }))
-        }).as_ref()
+        self.host_slot()
+            .get_or_init(|| make_host_copy(&self.desc, self.initial_state, self.clear_value))
+            .as_ref()
+    }
+
+    fn host_slot(&self) -> &HostSlot {
+        self.packed_source.as_deref().unwrap_or(&self.host)
     }
 
     fn data(&self) -> *mut u8 {
@@ -1317,6 +1303,80 @@ impl Resource {
             Backing::Address(at) => at,
         }
     }
+}
+
+type HostSlot = std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>;
+
+fn make_host_copy(
+    desc: &ResourceDesc,
+    state: u32,
+    clear: Option<[u32; 5]>,
+) -> Option<std::sync::Arc<HostTexture>> {
+    let texture = host_texture(desc, state, clear)?;
+    let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+    // Depth and unordered access (see `host_texture`).
+    const BOTH: u32 = 2 | 4;
+    let twin = (desc.flags & BOTH == BOTH)
+        .then(|| host_twin(&texture))
+        .flatten()
+        .map(|texture| {
+            std::sync::Arc::new(HostTexture {
+                lighting_layout: Default::default(),
+                texture,
+                state: 0.into(),
+                twin: None,
+            })
+        });
+    Some(std::sync::Arc::new(HostTexture {
+        lighting_layout: Default::default(),
+        texture,
+        state: state.into(),
+        twin,
+    }))
+}
+
+#[derive(Clone)]
+struct PackedLightSource {
+    desc: ResourceDesc,
+    initial_state: u32,
+    clear: Option<[u32; 5]>,
+    host: std::sync::Weak<HostSlot>,
+}
+
+// The slot is registered at guest creation, before either list records.
+// Upgrading a weak reference lets a reader materialize the same GPU texture
+// even when its producer is recorded afterwards and submitted first.
+static PACKED_LIGHT: std::sync::Mutex<std::collections::BTreeMap<u64, PackedLightSource>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+pub(crate) fn packed_light_source(
+    address: u64,
+    placed: This,
+) -> Option<std::sync::Arc<HostTexture>> {
+    let dst = &resource(placed).desc;
+    if dst.format != 67 || dst.flags & 7 != 0 || dst.sample_count != 1 {
+        return None;
+    }
+    let src = PACKED_LIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&address)?
+        .clone();
+    let shape = |d: &ResourceDesc| {
+        (
+            d.dimension,
+            d.width,
+            d.height,
+            d.depth_or_array_size,
+            d.mip_levels,
+        )
+    };
+    if shape(&src.desc) != shape(dst) {
+        return None;
+    }
+    let slot = src.host.upgrade()?;
+    slot.get_or_init(|| make_host_copy(&src.desc, src.initial_state, src.clear))
+        .clone()
 }
 
 fn resource<'a>(this: This) -> &'a Resource {
@@ -1346,10 +1406,32 @@ fn hand_out_resource(
         heap,
         heap_flags,
         backing,
-        host: std::sync::OnceLock::new(),
+        host: Default::default(),
+        packed_source: (desc.dimension != BUFFER
+            && desc.format == 42
+            && desc.flags & 4 != 0
+            && desc.flags & 2 == 0
+            && desc.sample_count == 1)
+            .then(std::sync::Arc::default),
         initial_state: state,
         clear_value,
     });
+    if desc.dimension != BUFFER && desc.flags & 7 != 0 {
+        let mut sources = PACKED_LIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        let address = resource.data() as u64;
+        sources.remove(&address);
+        if let Some(slot) = &resource.packed_source {
+            sources.insert(
+                address,
+                PackedLightSource {
+                    desc,
+                    initial_state: state,
+                    clear: clear_value,
+                    host: std::sync::Arc::downgrade(slot),
+                },
+            );
+        }
+    }
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
@@ -1359,9 +1441,19 @@ fn hand_out_resource(
 
 impl Drop for Resource {
     fn drop(&mut self) {
+        if let Some(slot) = &self.packed_source {
+            let mut sources = PACKED_LIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let address = self.data() as u64;
+            if sources
+                .get(&address)
+                .is_some_and(|s| s.host.ptr_eq(&std::sync::Arc::downgrade(slot)))
+            {
+                sources.remove(&address);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         if self
-            .host
+            .host_slot()
             .get()
             .and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)

@@ -1662,6 +1662,12 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 pub(crate) fn readable(list: &HostList, u: &UsedResource, view: &View) {
     const SHADER_RESOURCE: u32 = 0x40 | 0x80;
     const UNORDERED_ACCESS: u32 = 0x8;
+    let packed = match view {
+        View::Placed(false, desc, words) if desc[8] == 67 && matches!(words[0], 0 | 67) => {
+            Some(u64::from(words[10]) | u64::from(words[11]) << 32)
+        }
+        _ => None,
+    };
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -1680,7 +1686,11 @@ pub(crate) fn readable(list: &HostList, u: &UsedResource, view: &View) {
     }
     match (view, u.kind) {
         (View::Shader(resource, _), ResourceType::Srv) => {
-            if let Some(t) = crate::resource::host_resource(*resource as This)
+            let from_gpu = packed.is_some_and(|address| {
+                crate::texture::lighting::copy(list, *resource as This, address)
+            });
+            if !from_gpu
+                && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
             {
                 crate::texture::upload(list, *resource as This, t);

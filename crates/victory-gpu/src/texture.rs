@@ -15,6 +15,8 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
+pub(crate) mod lighting;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

@@ -2405,6 +2405,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+
+    mod packed_lighting;
+
     #[test]
     fn compute_dispatch_writes_placed_texture_and_buffer_uavs() {
         if !super::placed_fixture_process() { return; }
